@@ -12,95 +12,109 @@ const logger = require('./logger');
  * Core processing pipeline orchestrator
  */
 async function processEmail(messageId) {
+  console.log('=========================================');
+  console.log('📨 NEW EMAIL RECEIVED');
+  console.log('Message ID:', messageId);
+  console.log('Timestamp:', new Date().toISOString());
+
   try {
-    await logger.info('EmailProcessor', `Starting process for message: ${messageId}`);
-
-    // 1. Fetch full email content
+    // Step 1: Fetch email
+    console.log('Step 1: Fetching email...');
     const email = await fetchEmailContent(messageId);
-    const { threadId, senderEmail, subject, body, isAutoReply, senderTimezone, messageIdHeader } = email;
+    const { threadId, senderEmail, subject, body, isAutoReply, senderTimezone, messageIdHeader, from } = email;
+    console.log('From:', from);
+    console.log('Subject:', subject);
+    console.log('Thread ID:', threadId);
 
-    // 2. Check if scheduler is emergency paused
-    if (await isEmergencyPaused(subject, body)) {
-      await logger.info('EmailProcessor', `Scheduler is paused. Skipping message ${messageId}.`);
-      return { status: 'PAUSED' };
-    }
-
-    // 3. Skip user's own sent emails
+    // Step 2: Check if from self
+    console.log('Step 2: Checking if from self...');
     const ownerEmail = (process.env.USER_EMAIL || '').toLowerCase();
     if (ownerEmail && senderEmail === ownerEmail) {
-      await logger.info('EmailProcessor', `Skipping user's own email from ${senderEmail}`);
+      console.log('❌ Email is from self - skipping');
+      console.log('=========================================');
       return { status: 'SELF_EMAIL_SKIPPED' };
     }
 
-    // 4. Auto-responder detection
-    if (isAutoReply || isAutoResponder([], subject, body)) {
-      await logger.warn('EmailProcessor', `Auto-responder detected from ${senderEmail}. Halting processing.`);
-      await flagThreadForHuman(threadId, 'Auto-responder detected', { senderEmail });
-      return { status: 'AUTO_RESPONDER_STOPPED' };
-    }
-
-    // 5. Load thread state
+    // Step 3: Check if already processed / duplicate
+    console.log('Step 3: Checking duplicates...');
     let thread = await loadThreadState(threadId);
     const threadHistory = thread?.history || [];
-
-    // 6. Deduplication check
     if (isDuplicateEmail(messageId, body, threadHistory)) {
-      await logger.info('EmailProcessor', `Duplicate email detected for messageId ${messageId}`);
+      console.log('❌ Already processed - skipping');
+      console.log('=========================================');
       return { status: 'DUPLICATE_SKIPPED' };
     }
 
-    // 7. Infinite loop check (> 5 exchanges)
+    // Step 4: Check auto-responder
+    console.log('Step 4: Checking auto-responder...');
+    if (isAutoReply || isAutoResponder([], subject, body)) {
+      console.log('❌ Auto-responder detected - stopping');
+      await flagThreadForHuman(threadId, 'Auto-responder detected', { senderEmail });
+      console.log('=========================================');
+      return { status: 'AUTO_RESPONDER_STOPPED' };
+    }
+
+    // Check emergency pause & infinite loop
+    if (await isEmergencyPaused(subject, body)) {
+      console.log('❌ Scheduler is emergency paused - skipping');
+      console.log('=========================================');
+      return { status: 'PAUSED' };
+    }
+
     if (detectInfiniteLoop(threadHistory)) {
-      await logger.warn('EmailProcessor', `Possible infinite loop in thread ${threadId}`);
+      console.log('❌ Infinite loop safeguard triggered (>5 turns)');
       await flagThreadForHuman(threadId, 'Infinite loop safeguard (>5 turns)', { senderEmail });
+      console.log('=========================================');
       return { status: 'INFINITE_LOOP_FLAGGED' };
     }
 
-    // 8. If thread is already FLAGGED or BOOKED, skip or flag note
     if (thread?.state === 'FLAGGED') {
-      await logger.info('EmailProcessor', `Thread ${threadId} is already FLAGGED. Updating history without auto-reply.`);
+      console.log('❌ Thread is already FLAGGED - skipping auto-reply');
+      console.log('=========================================');
       return { status: 'THREAD_ALREADY_FLAGGED' };
     }
 
-    // 9. Classify intent
+    // Step 5: Classify intent
+    console.log('Step 5: Classifying intent...');
     const classification = await classifyEmail({
       subject,
       body,
       senderEmail,
       history: threadHistory
     });
+    console.log('Classification:', classification);
 
     if (classification.classification === 'NOT_SCHEDULING') {
-      await logger.info('EmailProcessor', `Message ${messageId} is NOT_SCHEDULING. Ignoring.`);
+      console.log('❌ Intent is NOT_SCHEDULING - ignoring');
+      console.log('=========================================');
       return { status: 'NOT_SCHEDULING_IGNORED' };
     }
 
     if (classification.classification === 'UNCERTAIN') {
-      await logger.warn('EmailProcessor', `Message ${messageId} classified as UNCERTAIN.`);
+      console.log('⚠️ Intent is UNCERTAIN - flagging for human review');
       await flagThreadForHuman(threadId, `Uncertain intent: ${classification.reasoning}`, { senderEmail });
+      console.log('=========================================');
       return { status: 'UNCERTAIN_FLAGGED' };
     }
 
-    // 10. Process SCHEDULING intent
+    // Step 6: Processing SCHEDULING intent
+    console.log('Step 6: Processing scheduling request...');
     const durationMinutes = classification.durationMinutes || 30;
 
     // Check if recipient is selecting a proposed slot from previous offer
     if (thread?.proposedSlots && thread.proposedSlots.length > 0) {
       let chosenSlot = null;
 
-      // Check choice indexing (e.g. Option 1, 2, 3) or matching text
       if (classification.userChoice) {
         if (typeof classification.userChoice === 'number' && thread.proposedSlots[classification.userChoice - 1]) {
           chosenSlot = thread.proposedSlots[classification.userChoice - 1];
         } else {
-          // Check matching slot in array
           chosenSlot = thread.proposedSlots.find(s =>
             (classification.userChoice && typeof classification.userChoice === 'string' && s.formattedSenderTz.toLowerCase().includes(classification.userChoice.toLowerCase()))
           );
         }
       }
 
-      // Default to first slot if explicitly confirmed (e.g. "That time works", "Sounds good")
       if (!chosenSlot && (body.toLowerCase().includes('option 1') || body.toLowerCase().includes('first option'))) {
         chosenSlot = thread.proposedSlots[0];
       } else if (!chosenSlot && body.toLowerCase().includes('option 2')) {
@@ -108,15 +122,15 @@ async function processEmail(messageId) {
       } else if (!chosenSlot && body.toLowerCase().includes('option 3')) {
         chosenSlot = thread.proposedSlots[2];
       } else if (!chosenSlot && (body.toLowerCase().includes('works') || body.toLowerCase().includes('sounds good') || body.toLowerCase().includes('perfect'))) {
-        chosenSlot = thread.proposedSlots[0]; // pick first proposed slot
+        chosenSlot = thread.proposedSlots[0];
       }
 
       if (chosenSlot) {
-        // DOUBLE CHECK SLOT AVAILABILITY AT BOOKING TIME
+        console.log('User chosen slot identified:', chosenSlot);
         const isFree = await checkSlotAvailable(chosenSlot.startISO, chosenSlot.endISO);
 
         if (isFree) {
-          // CREATE CALENDAR EVENT
+          console.log('Booking confirmed calendar event...');
           const eventDetails = await createCalendarEvent({
             summary: subject.replace(/^Re:\s*/i, ''),
             description: `Scheduled autonomously via Autonomous Scheduler.\n\nOriginal Request: ${body}`,
@@ -126,7 +140,6 @@ async function processEmail(messageId) {
             timeZone: senderTimezone || 'UTC'
           });
 
-          // GENERATE CONFIRMATION REPLY
           const replyText = await generateResponse({
             type: 'CONFIRMATION',
             bookedDetails: eventDetails,
@@ -149,9 +162,11 @@ async function processEmail(messageId) {
             finalSlot: chosenSlot
           });
 
+          console.log('✅ Email processed successfully: BOOKED');
+          console.log('=========================================');
           return { status: 'BOOKED_SUCCESS', event: eventDetails };
         } else {
-          // Slot was taken in the meantime! Offer fresh slots
+          console.log('Chosen slot unavailable; re-proposing new slots...');
           const newSlots = await findAvailableSlots({ durationMinutes, senderTimezone });
           const apologyReply = await generateResponse({
             type: 'APOLOGY_SLOT_TAKEN',
@@ -174,12 +189,15 @@ async function processEmail(messageId) {
             proposedSlots: newSlots
           });
 
+          console.log('✅ Email processed successfully: REPROPOSED');
+          console.log('=========================================');
           return { status: 'SLOT_TAKEN_REPROPOSED' };
         }
       }
     }
 
-    // 11. Initial Proposal or Counter-Offer Negotiation
+    // Initial proposal or negotiation
+    console.log('Finding open calendar slots...');
     const availableSlots = await findAvailableSlots({
       durationMinutes,
       senderTimezone: senderTimezone || classification.senderTimezone,
@@ -187,11 +205,14 @@ async function processEmail(messageId) {
     });
 
     if (!availableSlots || availableSlots.length === 0) {
+      console.log('❌ No open slots found - flagging thread');
       await flagThreadForHuman(threadId, 'No open calendar slots found meeting criteria', { senderEmail });
+      console.log('=========================================');
       return { status: 'NO_SLOTS_FLAGGED' };
     }
 
     const responseType = thread?.state === 'PROPOSED' ? 'NEGOTIATION' : 'PROPOSAL';
+    console.log(`Generating ${responseType} response text...`);
     const replyText = await generateResponse({
       type: responseType,
       proposedSlots: availableSlots,
@@ -200,6 +221,7 @@ async function processEmail(messageId) {
       originalEmail: body
     });
 
+    console.log('Sending reply via Gmail API...');
     await sendReply({
       threadId,
       to: senderEmail,
@@ -216,10 +238,14 @@ async function processEmail(messageId) {
       lastMessageId: messageId
     });
 
+    console.log(`✅ Email processed successfully: ${targetState}`);
+    console.log('=========================================');
     return { status: `${targetState}_SENT`, slots: availableSlots };
 
   } catch (err) {
+    console.error('❌ Unhandled error processing email:', err);
     await logger.error('EmailProcessor', `Unhandled error processing message ${messageId}`, err.stack);
+    console.log('=========================================');
     return { status: 'ERROR', error: err.message };
   }
 }

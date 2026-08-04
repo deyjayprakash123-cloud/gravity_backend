@@ -1,4 +1,6 @@
 const { google } = require('googleapis');
+const fs = require('fs-extra');
+const path = require('path');
 const { loadRefreshToken, saveRefreshToken } = require('./memory');
 const logger = require('./logger');
 
@@ -34,15 +36,45 @@ function getAuthUrl() {
  * Get authenticated Gmail client using stored refresh token
  */
 async function getGmailClient() {
-  const refreshToken = await loadRefreshToken();
-  if (!refreshToken) {
-    throw new Error('No OAuth refresh token available. User must connect Gmail first.');
+  try {
+    let refreshToken = await loadRefreshToken();
+    if (!refreshToken) {
+      const altTokenPath1 = path.join('/opt/render/project/data/tokens', 'refresh_token.json');
+      const altTokenPath2 = path.join('/opt/render/project/data/tokens', 'refresh-token.json');
+      if (fs.existsSync(altTokenPath1)) {
+        const raw = fs.readFileSync(altTokenPath1, 'utf8').trim();
+        try {
+          const parsed = JSON.parse(raw);
+          refreshToken = parsed.refreshToken || parsed.refresh_token || raw;
+        } catch (e) {
+          refreshToken = raw;
+        }
+      } else if (fs.existsSync(altTokenPath2)) {
+        const raw = fs.readFileSync(altTokenPath2, 'utf8').trim();
+        try {
+          const parsed = JSON.parse(raw);
+          refreshToken = parsed.refreshToken || parsed.refresh_token || raw;
+        } catch (e) {
+          refreshToken = raw;
+        }
+      }
+    }
+
+    if (!refreshToken) {
+      throw new Error('No refresh token found. User needs to authenticate first.');
+    }
+
+    const oauth2Client = createOAuth2Client();
+    oauth2Client.setCredentials({ refresh_token: refreshToken });
+
+    await oauth2Client.getAccessToken();
+    console.log('✅ Gmail client authenticated');
+
+    return google.gmail({ version: 'v1', auth: oauth2Client });
+  } catch (error) {
+    console.error('❌ Gmail auth failed:', error.message);
+    throw error;
   }
-
-  const oauth2Client = createOAuth2Client();
-  oauth2Client.setCredentials({ refresh_token: refreshToken });
-
-  return google.gmail({ version: 'v1', auth: oauth2Client });
 }
 
 /**
@@ -92,10 +124,9 @@ function getHeader(headers, name) {
 function getSenderTimezone(headers) {
   const dateHeader = getHeader(headers, 'Date');
   if (dateHeader) {
-    // Example: "Mon, 04 Aug 2026 10:00:00 -0400"
     const tzMatch = dateHeader.match(/([+-]\d{4})/);
     if (tzMatch) {
-      return tzMatch[1]; // e.g. -0400
+      return tzMatch[1];
     }
   }
   return null;
@@ -139,7 +170,6 @@ async function fetchEmailContent(messageId) {
   const messageIdHeader = getHeader(headers, 'Message-ID');
   const references = getHeader(headers, 'References');
 
-  // Extract clean email address from From header (e.g. "John Doe <john@example.com>" -> "john@example.com")
   const senderMatch = from.match(/<([^>]+)>/) || [null, from];
   const senderEmail = senderMatch[1].trim().toLowerCase();
 
@@ -167,45 +197,85 @@ async function fetchEmailContent(messageId) {
 /**
  * Send reply preserving thread context
  */
-async function sendReply({ threadId, to, subject, body, inReplyToMessageId }) {
-  const gmail = await getGmailClient();
+async function sendReply(arg1, arg2, arg3) {
+  let threadId, to, subject, body, inReplyToMessageId, auth;
 
-  const formattedSubject = subject.toLowerCase().startsWith('re:') ? subject : `Re: ${subject}`;
+  if (typeof arg1 === 'object' && arg1 !== null) {
+    threadId = arg1.threadId;
+    to = arg1.to;
+    subject = arg1.subject || 'Meeting Request';
+    body = arg1.body || arg1.replyText || '';
+    inReplyToMessageId = arg1.inReplyToMessageId || arg1.messageId;
+    auth = arg1.auth;
+  } else {
+    threadId = arg1;
+    body = arg2;
+    auth = arg3;
+  }
 
-  let rawEmail = [
-    `To: ${to}`,
-    `Subject: ${formattedSubject}`,
-    `In-Reply-To: ${inReplyToMessageId}`,
-    `References: ${inReplyToMessageId}`,
-    `Content-Type: text/plain; charset=utf-8`,
-    `MIME-Version: 1.0`,
-    '',
-    body
-  ].join('\r\n');
+  try {
+    const gmail = auth ? google.gmail({ version: 'v1', auth }) : await getGmailClient();
 
-  const encodedMessage = Buffer.from(rawEmail)
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
+    let lastMessageId = inReplyToMessageId;
+    let targetSubject = subject;
+    let targetTo = to;
 
-  const res = await gmail.users.messages.send({
-    userId: 'me',
-    requestBody: {
-      raw: encodedMessage,
-      threadId: threadId
+    if (!targetTo || !targetSubject || !lastMessageId) {
+      const threadRes = await gmail.users.threads.get({ userId: 'me', id: threadId });
+      const messages = threadRes.data.messages || [];
+      const lastMessage = messages[messages.length - 1];
+      if (lastMessage) {
+        lastMessageId = lastMessageId || lastMessage.id;
+        const headers = lastMessage.payload.headers || [];
+        const subjHeader = headers.find(h => h.name.toLowerCase() === 'subject')?.value || 'Meeting Request';
+        targetSubject = targetSubject || (subjHeader.toLowerCase().startsWith('re:') ? subjHeader : `Re: ${subjHeader}`);
+        const fromHeader = headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
+        targetTo = targetTo || fromHeader;
+      }
     }
-  });
 
-  await logger.info('GmailService', `Sent reply to ${to} in thread ${threadId}`, { messageId: res.data.id });
-  return res.data;
+    const formattedSubject = targetSubject.toLowerCase().startsWith('re:') ? targetSubject : `Re: ${targetSubject}`;
+
+    const rawEmail = [
+      `To: ${targetTo}`,
+      `Subject: ${formattedSubject}`,
+      `In-Reply-To: ${lastMessageId}`,
+      `References: ${lastMessageId}`,
+      `Content-Type: text/plain; charset=utf-8`,
+      `MIME-Version: 1.0`,
+      '',
+      body
+    ].join('\r\n');
+
+    const encodedMessage = Buffer.from(rawEmail)
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    const response = await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: {
+        raw: encodedMessage,
+        threadId: threadId
+      }
+    });
+
+    console.log('✅ Reply sent! Message ID:', response.data.id);
+    await logger.info('GmailService', `Sent reply in thread ${threadId}`, { messageId: response.data.id });
+    return response.data;
+  } catch (error) {
+    console.error('❌ Failed to send reply:', error);
+    throw error;
+  }
 }
 
 /**
  * Set up Gmail Push Notifications (Watch API)
  */
 async function setupGmailWatch(topicName) {
-  if (!topicName) {
+  const targetTopic = topicName || process.env.PUBSUB_TOPIC;
+  if (!targetTopic) {
     logger.warn('GmailService', 'No Pub/Sub topicName provided for Gmail watch setup');
     return null;
   }
@@ -214,7 +284,7 @@ async function setupGmailWatch(topicName) {
     const res = await gmail.users.watch({
       userId: 'me',
       requestBody: {
-        topicName,
+        topicName: targetTopic,
         labelIds: ['INBOX']
       }
     });
@@ -228,7 +298,29 @@ async function setupGmailWatch(topicName) {
 }
 
 /**
- * Renew Gmail watch (expires every 7 days)
+ * Verify push notifications status
+ */
+async function verifyPushNotifications(auth) {
+  const gmail = auth ? google.gmail({ version: 'v1', auth }) : await getGmailClient();
+  const topicName = process.env.PUBSUB_TOPIC;
+  try {
+    const response = await gmail.users.watch({
+      userId: 'me',
+      requestBody: {
+        labelIds: ['INBOX'],
+        topicName: topicName
+      }
+    });
+    console.log('Watch active until:', new Date(response.data.expiration));
+    return response.data;
+  } catch (error) {
+    console.error('Watch setup failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Renew Gmail watch
  */
 async function renewGmailWatch(topicName) {
   return await setupGmailWatch(topicName);
@@ -242,6 +334,7 @@ module.exports = {
   fetchEmailContent,
   sendReply,
   setupGmailWatch,
+  verifyPushNotifications,
   renewGmailWatch,
   checkAutoResponderHeaders,
   getSenderTimezone

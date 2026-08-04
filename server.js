@@ -1,8 +1,10 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { initializeStorage, listAllThreads, loadThreadState, getSchedulerState, setSchedulerState, saveUserRules, loadUserRules, saveToneProfile, loadToneProfile } = require('./services/memory');
-const { handleOAuthCode, getAuthUrl, setupGmailWatch } = require('./services/gmailService');
+const fs = require('fs-extra');
+const path = require('path');
+const { initializeStorage, listAllThreads, loadThreadState, getSchedulerState, setSchedulerState, saveUserRules, loadUserRules, saveToneProfile, loadToneProfile, LOGS_DIR } = require('./services/memory');
+const { handleOAuthCode, getAuthUrl, setupGmailWatch, getGmailClient, verifyPushNotifications } = require('./services/gmailService');
 const { initializeUserSetup } = require('./services/setupService');
 const { processEmail } = require('./services/emailProcessor');
 const { transitionThread, cleanupOldThreads } = require('./services/stateMachine');
@@ -38,12 +40,52 @@ setInterval(() => {
 /**
  * Health Check Endpoint
  */
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString()
-  });
+app.get('/health', async (req, res) => {
+  try {
+    const gmail = await getGmailClient();
+    const profile = await gmail.users.getProfile({ userId: 'me' });
+
+    res.json({
+      status: 'healthy',
+      gmail: 'connected',
+      email: profile.data.emailAddress,
+      timestamp: new Date().toISOString(),
+      memory: process.memoryUsage()
+    });
+  } catch (error) {
+    res.json({
+      status: 'unhealthy',
+      gmail: 'disconnected',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+/**
+ * Debug Logs Endpoint
+ */
+app.get('/debug/logs', (req, res) => {
+  try {
+    const logDir = LOGS_DIR || path.join(__dirname, 'data/logs');
+
+    if (!fs.existsSync(logDir)) {
+      return res.json({ logs: 'No logs directory found' });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    const logFile = path.join(logDir, `${today}.log`);
+
+    if (fs.existsSync(logFile)) {
+      const logs = fs.readFileSync(logFile, 'utf8');
+      const recentLogs = logs.split('\n').slice(-50).join('\n');
+      return res.json({ logs: recentLogs });
+    }
+
+    res.json({ logs: 'No logs for today' });
+  } catch (error) {
+    res.json({ error: error.message });
+  }
 });
 
 /**
@@ -86,26 +128,88 @@ app.get('/oauth/callback', async (req, res) => {
  * Gmail Webhook Notification Endpoint (Pub/Sub)
  */
 app.post('/webhook/gmail', async (req, res) => {
-  // Acknowledge immediately to Pub/Sub
+  console.log('🔔 WEBHOOK RECEIVED');
+  console.log('Body:', JSON.stringify(req.body));
+
+  // IMPORTANT: Respond 200 immediately
   res.status(200).send('OK');
 
   try {
     const message = req.body.message;
-    if (!message || !message.data) return;
 
-    const decodedData = Buffer.from(message.data, 'base64').toString('utf8');
-    const pubSubPayload = JSON.parse(decodedData);
-
-    const { emailAddress, historyId } = pubSubPayload;
-    await logger.info('Server', `Received Gmail webhook push notification for ${emailAddress} [HistoryID: ${historyId}]`);
-
-    // In a real production setup, historyId is resolved to message IDs via gmail.users.history.list
-    // For test triggers, if payload passes messageId directly:
-    if (pubSubPayload.messageId) {
-      await processEmail(pubSubPayload.messageId);
+    if (!message) {
+      console.log('❌ No message in webhook body');
+      return;
     }
-  } catch (err) {
-    await logger.error('Server', 'Error processing Gmail webhook payload', err.message);
+
+    const dataStr = Buffer.from(message.data, 'base64').toString('utf8');
+    const data = JSON.parse(dataStr);
+    console.log('Decoded data:', data);
+
+    if (data.messageId) {
+      await processEmail(data.messageId);
+    }
+
+    const historyId = data.historyId;
+    if (historyId) {
+      try {
+        const gmail = await getGmailClient();
+        const history = await gmail.users.history.list({
+          userId: 'me',
+          startHistoryId: historyId,
+          historyTypes: ['messageAdded']
+        });
+
+        if (history.data.history) {
+          for (const h of history.data.history) {
+            if (h.messagesAdded) {
+              for (const msg of h.messagesAdded) {
+                if (msg.message && msg.message.id) {
+                  await processEmail(msg.message.id);
+                }
+              }
+            }
+          }
+        }
+      } catch (histErr) {
+        console.error('Error fetching Gmail history:', histErr.message);
+      }
+    }
+  } catch (error) {
+    console.error('❌ Error processing webhook:', error);
+  }
+});
+
+/**
+ * Manual Test Endpoint: process recent unread emails
+ */
+app.get('/test-process-recent', async (req, res) => {
+  try {
+    const gmail = await getGmailClient();
+
+    // Get 5 most recent unread messages
+    const messages = await gmail.users.messages.list({
+      userId: 'me',
+      maxResults: 5,
+      q: 'is:unread'
+    });
+
+    const results = [];
+
+    if (messages.data.messages) {
+      for (const msg of messages.data.messages) {
+        console.log('Manually processing:', msg.id);
+        const procResult = await processEmail(msg.id);
+        results.push(`Processed: ${msg.id} - ${procResult?.status || 'DONE'}`);
+      }
+    } else {
+      results.push('No unread messages found');
+    }
+
+    res.json({ success: true, results });
+  } catch (error) {
+    console.error('Test failed:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
