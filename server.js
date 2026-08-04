@@ -804,9 +804,26 @@ app.get('/api/credits/check', async (req, res) => {
 });
 
 app.get('/api/global/users', async (req, res) => {
-  const usersListPath = path.join(DATA_DIR, 'global', 'users-list.json');
-  const users = await fs.pathExists(usersListPath) ? await fs.readJson(usersListPath) : [];
-  return res.json({ users, count: users.length });
+  try {
+    const userSet = new Set();
+    const usersListPath = path.join(DATA_DIR, 'global', 'users-list.json');
+    if (await fs.pathExists(usersListPath)) {
+      const list = await fs.readJson(usersListPath);
+      (list || []).forEach(u => userSet.add(u.toLowerCase().trim()));
+    }
+    
+    if (await fs.pathExists(USERS_DIR)) {
+      const dirs = await fs.readdir(USERS_DIR);
+      for (const d of dirs) {
+        if (d.includes('@')) userSet.add(d.toLowerCase().trim());
+      }
+    }
+    
+    const users = Array.from(userSet);
+    return res.json({ users, count: users.length });
+  } catch (err) {
+    return res.json({ users: [], count: 0 });
+  }
 });
 
 // ============ GLOBAL SCHEDULER - Checks all users every 2 minutes ============
