@@ -1,4 +1,6 @@
 const { google } = require('googleapis');
+const fs = require('fs-extra');
+const path = require('path');
 const { createOAuth2Client } = require('./oauthService');
 const { getUserTokens } = require('./userManager');
 const logger = require('./logger');
@@ -14,6 +16,16 @@ const INDIAN_HOLIDAYS_2026 = [
   '2026-12-25'  // Christmas
 ];
 
+/**
+ * Create Google OAuth2 Client
+ */
+function getOAuth2Client() {
+  return createOAuth2Client();
+}
+
+/**
+ * Get Google Calendar client for a specific user
+ */
 async function getCalendarClient(userEmail) {
   const tokens = await getUserTokens(userEmail);
   if (!tokens || (!tokens.refresh_token && !tokens.refreshToken)) {
@@ -25,6 +37,32 @@ async function getCalendarClient(userEmail) {
   oauth2Client.setCredentials({ ...tokens, refresh_token: refreshToken });
 
   return google.calendar({ version: 'v3', auth: oauth2Client });
+}
+
+/**
+ * Analyze past 90 days of events for a user
+ */
+async function analyze90Days(userEmail) {
+  try {
+    const calendar = await getCalendarClient(userEmail);
+
+    const ninetyDaysAgo = new Date();
+    ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+
+    const events = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: ninetyDaysAgo.toISOString(),
+      timeMax: new Date().toISOString(),
+      singleEvents: true,
+      orderBy: 'startTime',
+      maxResults: 2500
+    });
+
+    return events.data.items || [];
+  } catch (error) {
+    console.error(`Error in 90-day analysis for ${userEmail}:`, error.message);
+    return [];
+  }
 }
 
 async function analyze90DayHistory(userEmail) {
@@ -192,7 +230,10 @@ async function createCalendarEvent({ userEmail, summary, description, startISO, 
 }
 
 module.exports = {
+  createOAuth2Client,
+  getOAuth2Client,
   getCalendarClient,
+  analyze90Days,
   analyze90DayHistory,
   checkFreeBusy,
   checkSlotAvailable,

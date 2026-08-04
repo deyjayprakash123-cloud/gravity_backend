@@ -15,7 +15,8 @@ const {
   saveUserTone,
   listUserThreads,
   getUserThread,
-  LOGS_DIR
+  getUserPaths,
+  BASE_DIR
 } = require('./services/userManager');
 const { generateOAuthUrl, handleOAuthCallback } = require('./services/oauthService');
 const { processEmail } = require('./services/emailProcessor');
@@ -34,20 +35,32 @@ const parsedPort = parseInt(rawPort, 10);
 const PORT = (!isNaN(parsedPort) && parsedPort > 0) ? parsedPort : 10000;
 const TIMEZONE = 'Asia/Kolkata';
 
+// Prevent infinite loops and log all requests (AT THE VERY TOP BEFORE ALL ROUTES)
+app.use((req, res, next) => {
+  // Skip logging for health checks to reduce noise
+  if (req.path === '/health') {
+    return next();
+  }
+
+  // Log the request once
+  console.log(`📥 [${req.method}] ${req.path} - Query:`, JSON.stringify(req.query));
+
+  // Prevent the request from being processed multiple times
+  if (req._processed) {
+    console.log('⚠️ Duplicate request detected, skipping');
+    return res.status(200).json({ error: 'Request already processed' });
+  }
+  req._processed = true;
+
+  next();
+});
+
 // Enable CORS and JSON parsing
 app.use(cors({
   origin: ['https://gravity-frontend-rose.vercel.app', 'http://localhost:3000', 'http://localhost:3001'],
   credentials: true
 }));
 app.use(express.json());
-
-// Request logging middleware
-app.use((req, res, next) => {
-  if (Object.keys(req.query).length > 0) {
-    console.log(`📥 [${req.method}] ${req.path} - Query Params:`, JSON.stringify(req.query));
-  }
-  next();
-});
 
 // Initialize storage and background scheduler
 initStorage().then(() => {
@@ -174,54 +187,126 @@ app.get('/api/user/status', async (req, res) => {
 });
 
 /**
- * User Dashboard Overview Stats API
+ * Shared Dashboard Handler (NO RECURSION, NO CALL STACK EXCEEDED)
  */
-app.get('/api/user/dashboard', async (req, res) => {
-  const email = req.query.email;
-  if (!email) return res.status(400).json({ error: 'email query parameter required' });
-
+async function handleDashboardRequest(req, res) {
   try {
-    const state = await getUserState(email);
-    const threads = await listUserThreads(email);
-    const stats = await getUserStats(email);
-    const tokens = await getUserTokens(email);
-    const rules = await getUserRules(email);
+    const email = req.query.email;
 
-    const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
+    if (!email) {
+      return res.status(400).json({ error: 'Email required' });
+    }
 
-    const todayThreads = threads.filter(t => t.lastUpdated && t.lastUpdated.startsWith(todayStr));
-    const bookedToday = todayThreads.filter(t => t.state === 'BOOKED');
-    const flagged = threads.filter(t => t.state === 'FLAGGED');
+    const usersBase = path.join(BASE_DIR, 'users');
+    const userDir = path.join(usersBase, email.trim().toLowerCase());
+    const userExists = await fs.pathExists(userDir);
 
-    res.json({
-      status: state.paused ? 'PAUSED' : 'ACTIVE',
-      authenticated: !!tokens,
-      rulesConfirmed: !!(rules && rules.confirmed),
+    if (!userExists) {
+      return res.json({
+        status: 'new_user',
+        stats: {
+          emailsHandled: 0,
+          meetingsBooked: 0,
+          activeThreads: 0,
+          needsAttention: 0
+        },
+        recentActivity: [],
+        message: 'Setup required'
+      });
+    }
+
+    // Get user stats
+    let stats = {
+      emailsHandled: 0,
+      meetingsBooked: 0,
+      activeThreads: 0,
+      needsAttention: 0
+    };
+
+    const statsPath = path.join(userDir, 'stats.json');
+    if (await fs.pathExists(statsPath)) {
+      try {
+        const rawStats = await fs.readJson(statsPath);
+        stats = {
+          emailsHandled: rawStats.totalEmailsHandled || rawStats.emailsHandled || rawStats.emailsToday || 0,
+          meetingsBooked: rawStats.totalMeetingsBooked || rawStats.meetingsBooked || rawStats.meetingsToday || 0,
+          activeThreads: rawStats.activeThreads || 0,
+          needsAttention: rawStats.totalThreadsFlagged || rawStats.needsAttention || 0
+        };
+      } catch (e) {}
+    }
+
+    // Get recent activity
+    let recentActivity = [];
+    const threadsDir = path.join(userDir, 'threads');
+    if (await fs.pathExists(threadsDir)) {
+      const threadFiles = await fs.readdir(threadsDir);
+      const threads = [];
+
+      for (const file of threadFiles) {
+        if (file.endsWith('.json')) {
+          try {
+            const threadData = await fs.readJson(path.join(threadsDir, file));
+            threads.push(threadData);
+          } catch (e) {}
+        }
+      }
+
+      // Get recent activity from threads
+      threads.forEach(thread => {
+        if (thread.history) {
+          thread.history.forEach(h => {
+            recentActivity.push({
+              timestamp: h.timestamp || thread.lastUpdated || new Date().toISOString(),
+              action: h.action || h.to || 'PROPOSED_SLOTS',
+              senderEmail: thread.senderEmail || thread.sender || 'Unknown',
+              details: h.slots ? `${h.slots.length} slots proposed` : (h.eventDetails ? 'Meeting booked' : (h.reason || 'Activity logged')),
+              threadId: thread.threadId
+            });
+          });
+        }
+      });
+
+      // Sort by timestamp descending, take last 50
+      recentActivity.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+      recentActivity = recentActivity.slice(0, 50);
+    }
+
+    // Count active threads
+    const activeCount = recentActivity.filter(a =>
+      a.action === 'PROPOSED_SLOTS' || a.action === 'NEGOTIATING' || a.action === 'PROPOSED'
+    ).length;
+
+    return res.json({
+      status: 'active',
       stats: {
-        emailsHandledToday: todayThreads.length,
-        meetingsBookedToday: bookedToday.length,
-        activeThreads: threads.filter(t => t.state !== 'BOOKED' && t.state !== 'COMPLETED').length,
-        needsAttention: flagged.length,
-        totalEmailsHandled: stats.totalEmailsHandled || 0,
-        totalMeetingsBooked: stats.totalMeetingsBooked || 0
+        ...stats,
+        activeThreads: activeCount || stats.activeThreads || 0,
+        needsAttention: stats.needsAttention || 0
       },
-      flaggedThreads: flagged,
-      recentActivity: stats.recentActivity || [],
-      timestamp: new Date().toISOString()
+      recentActivity
     });
-  } catch (error) {
-    console.error(`❌ Dashboard error for ${email}:`, error.message);
-    res.status(500).json({ error: 'Failed to load user dashboard' });
-  }
-});
 
-// Fallback GET /api/dashboard
-app.get('/api/dashboard', async (req, res) => {
-  const email = req.query.email || 'user@example.com';
-  req.query.email = email;
-  return app._router.handle(req, res);
-});
+  } catch (error) {
+    console.error('Dashboard error:', error.message);
+    return res.status(500).json({
+      error: 'Failed to load dashboard',
+      stats: {
+        emailsHandled: 0,
+        meetingsBooked: 0,
+        activeThreads: 0,
+        needsAttention: 0
+      },
+      recentActivity: []
+    });
+  }
+}
+
+/**
+ * Dashboard API Endpoints
+ */
+app.get('/api/user/dashboard', handleDashboardRequest);
+app.get('/api/dashboard', handleDashboardRequest);
 
 /**
  * User Stats API
