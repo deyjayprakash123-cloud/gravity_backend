@@ -812,8 +812,11 @@ cron.schedule('*/10 * * * *', async () => {
 });
 
 // ============ START SERVER ============
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
+const rawPort = process.env.PORT;
+const parsedPort = parseInt(rawPort, 10);
+const PORT = (!isNaN(parsedPort) && parsedPort > 0) ? parsedPort : 10000;
+
+app.listen(PORT, '0.0.0.0', () => {
   console.log('========================================');
   console.log('🚀 MEETING SCHEDULER AI - SERVER READY');
   console.log('========================================');
