@@ -3,7 +3,8 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs-extra');
 const path = require('path');
-const { initializeStorage, listAllThreads, loadThreadState, getSchedulerState, setSchedulerState, saveUserRules, loadUserRules, saveToneProfile, loadToneProfile, LOGS_DIR } = require('./services/memory');
+const cron = require('node-cron');
+const { initializeStorage, listAllThreads, loadThreadState, getSchedulerState, setSchedulerState, saveUserRules, loadUserRules, saveToneProfile, loadToneProfile, loadRefreshToken, LOGS_DIR } = require('./services/memory');
 const { handleOAuthCode, getAuthUrl, setupGmailWatch, getGmailClient, verifyPushNotifications } = require('./services/gmailService');
 const { initializeUserSetup } = require('./services/setupService');
 const { processEmail } = require('./services/emailProcessor');
@@ -13,6 +14,10 @@ const { rotateLogs } = require('./services/logger');
 const logger = require('./services/logger');
 
 const app = express();
+
+// Parse query params reliably
+app.set('query parser', 'simple');
+
 const rawPort = process.env.PORT;
 const parsedPort = parseInt(rawPort, 10);
 const PORT = (!isNaN(parsedPort) && parsedPort > 0) ? parsedPort : 10000;
@@ -24,6 +29,14 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json());
+
+// Request logging middleware
+app.use((req, res, next) => {
+  if (Object.keys(req.query).length > 0) {
+    console.log(`📥 [${req.method}] ${req.path} - Query Params:`, JSON.stringify(req.query));
+  }
+  next();
+});
 
 // Initialize persistent directories on startup
 initializeStorage().then(() => {
@@ -40,6 +53,35 @@ setInterval(() => {
   rotateLogs();
   cleanupOldThreads();
 }, 24 * 60 * 60 * 1000);
+
+// Polling fallback every 2 minutes
+cron.schedule('*/2 * * * *', async () => {
+  try {
+    const refreshToken = await loadRefreshToken();
+    if (!refreshToken) return;
+
+    const rules = await loadUserRules();
+    if (!rules || !rules.confirmed) return;
+
+    const schedulerState = await getSchedulerState();
+    if (schedulerState.paused) return;
+
+    const gmail = await getGmailClient();
+    const messages = await gmail.users.messages.list({
+      userId: 'me',
+      q: 'is:unread -from:me',
+      maxResults: 5
+    });
+
+    if (messages.data.messages) {
+      for (const msg of messages.data.messages) {
+        await processEmail(msg.id);
+      }
+    }
+  } catch (err) {
+    // Routine polling silent check
+  }
+});
 
 /**
  * Root Route (GET /) - Shows server status
@@ -131,40 +173,63 @@ app.get('/auth/url', (req, res) => {
 });
 
 /**
- * OAuth Callback Redirect
+ * OAuth Callback Route (FIXED: Supports JSON response for fetch & browser redirect)
  */
 app.get('/oauth/callback', async (req, res) => {
   console.log('🔑 OAuth callback received');
-  console.log('Query params:', req.query);
+  console.log('Query params:', JSON.stringify(req.query));
 
-  const { code, error } = req.query;
+  const { code, error, error_description } = req.query;
+  const acceptHeader = req.headers['accept'] || '';
+  const wantsJson = acceptHeader.includes('application/json') || req.query.format === 'json';
   const frontendUrl = process.env.FRONTEND_URL || 'https://gravity-frontend-rose.vercel.app';
 
-  if (error) {
-    console.error('❌ OAuth error:', error);
+  if (error || error_description) {
+    console.error('❌ OAuth error:', error || error_description);
+    if (wantsJson) {
+      return res.status(400).json({ success: false, error: error_description || error || 'OAuth denied' });
+    }
     return res.redirect(`${frontendUrl}/setup?error=oauth_denied`);
   }
 
   if (!code) {
     console.error('❌ No authorization code received');
+    if (wantsJson) {
+      return res.status(400).json({ success: false, error: 'No authorization code received' });
+    }
     return res.redirect(`${frontendUrl}/setup?error=no_code`);
   }
 
   try {
     const tokens = await handleOAuthCode(code);
     const userEmail = process.env.USER_EMAIL || 'user@example.com';
-
     await initializeUserSetup(userEmail);
 
     const topicName = process.env.PUBSUB_TOPIC || process.env.GMAIL_PUBSUB_TOPIC;
     if (topicName) {
-      await setupGmailWatch(topicName);
+      try {
+        await setupGmailWatch(topicName);
+      } catch (watchErr) {
+        console.warn('Pub/Sub watch warning:', watchErr.message);
+      }
     }
 
-    console.log('✅ Authorization code received & setup complete');
+    console.log('✅ Authorization code received & tokens stored successfully');
+
+    if (wantsJson) {
+      return res.status(200).json({
+        success: true,
+        message: 'Gmail connected and setup completed successfully',
+        tokensReceived: true
+      });
+    }
+
     res.redirect(`${frontendUrl}/setup?status=connected`);
   } catch (err) {
     await logger.error('Server', 'OAuth Callback Failed', err.message);
+    if (wantsJson) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
     res.redirect(`${frontendUrl}/setup?error=token_failed`);
   }
 });
@@ -234,7 +299,6 @@ app.get('/test-process-recent', async (req, res) => {
   try {
     const gmail = await getGmailClient();
 
-    // Get 5 most recent unread messages
     const messages = await gmail.users.messages.list({
       userId: 'me',
       maxResults: 5,
@@ -261,7 +325,7 @@ app.get('/test-process-recent', async (req, res) => {
 });
 
 /**
- * Direct Manual Message Processing Trigger API (for testing & web UI)
+ * Direct Manual Message Processing Trigger API
  */
 app.post('/api/process-message', async (req, res) => {
   const { messageId } = req.body;
@@ -280,6 +344,8 @@ app.post('/api/process-message', async (req, res) => {
  */
 app.get('/api/dashboard', async (req, res) => {
   try {
+    const refreshToken = await loadRefreshToken();
+    const rules = await loadUserRules();
     const state = await getSchedulerState();
     const threads = await listAllThreads();
 
@@ -301,11 +367,15 @@ app.get('/api/dashboard', async (req, res) => {
 
     res.json({
       status: state.paused ? 'PAUSED' : 'ACTIVE',
+      authenticated: !!refreshToken,
+      rulesConfirmed: !!(rules && rules.confirmed),
       stats: {
         emailsHandledToday: todayThreads.length,
         meetingsBookedToday: bookedToday.length,
         activeThreads: threads.filter(t => t.state !== 'BOOKED').length,
-        needsAttention: flagged.length
+        needsAttention: flagged.length,
+        emailsHandled: todayThreads.length,
+        meetingsBooked: bookedToday.length
       },
       flaggedThreads: flagged,
       recentActivity,
