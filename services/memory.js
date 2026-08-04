@@ -14,7 +14,12 @@ const LOGS_DIR = path.join(BASE_DIR, 'logs');
 const STATE_FILE = path.join(BASE_DIR, 'scheduler-state.json');
 const RULES_FILE = path.join(RULES_DIR, 'user-rules.json');
 const TONE_FILE = path.join(RULES_DIR, 'user-tone.json');
-const TOKEN_FILE = path.join(TOKENS_DIR, 'refresh-token.json');
+
+const TOKEN_FILES = [
+  path.join(TOKENS_DIR, 'user-tokens.json'),
+  path.join(TOKENS_DIR, 'refresh-token.json'),
+  path.join(TOKENS_DIR, 'refresh_token.json')
+];
 
 /**
  * Ensures all required storage directories exist.
@@ -138,19 +143,27 @@ async function loadToneProfile() {
  */
 async function saveRefreshToken(tokenData) {
   await fs.ensureDir(TOKENS_DIR);
-  const payload = typeof tokenData === 'string' ? { refreshToken: tokenData } : tokenData;
+  const payload = typeof tokenData === 'string' ? { refreshToken: tokenData, refresh_token: tokenData } : tokenData;
   payload.updatedAt = new Date().toISOString();
-  await fs.writeJson(TOKEN_FILE, payload, { spaces: 2 });
+
+  for (const file of TOKEN_FILES) {
+    await fs.writeJson(file, payload, { spaces: 2 });
+  }
 }
 
 async function loadRefreshToken() {
-  if (!await fs.pathExists(TOKEN_FILE)) return null;
-  try {
-    const data = await fs.readJson(TOKEN_FILE);
-    return data.refreshToken || data;
-  } catch (err) {
-    return null;
+  for (const file of TOKEN_FILES) {
+    if (await fs.pathExists(file)) {
+      try {
+        const data = await fs.readJson(file);
+        const token = data.refresh_token || data.refreshToken || (typeof data === 'string' ? data : null);
+        if (token) return token;
+      } catch (err) {
+        // try next file
+      }
+    }
   }
+  return null;
 }
 
 /**

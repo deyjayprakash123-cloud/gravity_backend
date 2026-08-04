@@ -16,6 +16,7 @@ const app = express();
 const rawPort = process.env.PORT;
 const parsedPort = parseInt(rawPort, 10);
 const PORT = (!isNaN(parsedPort) && parsedPort > 0) ? parsedPort : 10000;
+const TIMEZONE = 'Asia/Kolkata';
 
 // Enable CORS and JSON parsing
 app.use(cors({
@@ -46,17 +47,19 @@ setInterval(() => {
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
-    message: 'Meeting Scheduler Backend is active',
+    app: 'Meeting Scheduler AI',
+    timezone: TIMEZONE,
+    serverTime: new Date().toLocaleString('en-IN', { timeZone: TIMEZONE }),
     endpoints: [
-      'GET /health - Health check',
-      'POST /webhook/gmail - Gmail push notifications',
-      'GET /oauth/callback - Google OAuth callback',
-      'GET /api/dashboard - Activity dashboard data',
-      'GET /api/threads - Active threads list',
-      'GET /debug/logs - System logs',
-      'GET /test-process-recent - Process recent unread emails'
-    ],
-    timestamp: new Date().toISOString()
+      'GET /health',
+      'POST /webhook/gmail',
+      'GET /oauth/callback',
+      'GET /api/dashboard',
+      'GET /api/threads',
+      'POST /api/rules/confirm',
+      'POST /api/pause',
+      'POST /api/resume'
+    ]
   });
 });
 
@@ -73,7 +76,8 @@ app.get('/health', async (req, res) => {
       gmail: 'connected',
       email: profile.data.emailAddress,
       uptime: process.uptime(),
-      timestamp: new Date().toISOString(),
+      timezone: TIMEZONE,
+      serverTime: new Date().toLocaleString('en-IN', { timeZone: TIMEZONE }),
       memory: process.memoryUsage()
     });
   } catch (error) {
@@ -82,7 +86,8 @@ app.get('/health', async (req, res) => {
       gmail: 'disconnected',
       error: error.message,
       uptime: process.uptime(),
-      timestamp: new Date().toISOString()
+      timezone: TIMEZONE,
+      serverTime: new Date().toLocaleString('en-IN', { timeZone: TIMEZONE })
     });
   }
 });
@@ -148,9 +153,15 @@ app.get('/oauth/callback', async (req, res) => {
   try {
     const tokens = await handleOAuthCode(code);
     const userEmail = process.env.USER_EMAIL || 'user@example.com';
+
     await initializeUserSetup(userEmail);
 
-    console.log('✅ Authorization code received & processed successfully');
+    const topicName = process.env.PUBSUB_TOPIC || process.env.GMAIL_PUBSUB_TOPIC;
+    if (topicName) {
+      await setupGmailWatch(topicName);
+    }
+
+    console.log('✅ Authorization code received & setup complete');
     res.redirect(`${frontendUrl}/setup?status=connected`);
   } catch (err) {
     await logger.error('Server', 'OAuth Callback Failed', err.message);
@@ -227,7 +238,7 @@ app.get('/test-process-recent', async (req, res) => {
     const messages = await gmail.users.messages.list({
       userId: 'me',
       maxResults: 5,
-      q: 'is:unread'
+      q: 'is:unread -from:me'
     });
 
     const results = [];
@@ -297,10 +308,11 @@ app.get('/api/dashboard', async (req, res) => {
         needsAttention: flagged.length
       },
       flaggedThreads: flagged,
-      recentActivity
+      recentActivity,
+      timestamp: new Date().toISOString()
     });
-  } catch (err) {
-    console.error('❌ Dashboard error:', err.message);
+  } catch (error) {
+    console.error('❌ Dashboard error:', error.message);
     res.status(500).json({ error: 'Failed to load dashboard' });
   }
 });
@@ -315,8 +327,8 @@ app.get('/api/threads', async (req, res) => {
       threads,
       total: threads.length
     });
-  } catch (err) {
-    console.error('❌ Threads error:', err.message);
+  } catch (error) {
+    console.error('❌ Threads error:', error.message);
     res.status(500).json({ error: 'Failed to load threads' });
   }
 });
@@ -348,13 +360,20 @@ app.get('/api/rules', async (req, res) => {
 
 app.post('/api/rules/confirm', async (req, res) => {
   try {
-    const rules = req.body.rules;
-    if (!rules) return res.status(400).json({ error: 'rules required' });
+    const rulesInput = req.body.rules || req.body;
+    if (!rulesInput) return res.status(400).json({ error: 'rules required' });
 
-    const saved = await saveUserRules(rules);
+    const confirmedRules = {
+      ...rulesInput,
+      confirmed: true,
+      updatedAt: new Date().toISOString()
+    };
+
+    const saved = await saveUserRules(confirmedRules);
     await logger.info('Server', 'Confirmed updated user rules', saved);
     res.json({ success: true, rules: saved });
   } catch (err) {
+    console.error('❌ Rules confirmation error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

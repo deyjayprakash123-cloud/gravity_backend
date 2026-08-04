@@ -1,7 +1,7 @@
 const { analyze90DayHistory } = require('./calendarService');
-const { generateProposedRules, getEffectiveRules } = require('./ruleEngine');
-const { saveUserRules, saveToneProfile, saveThreadState, loadThreadState } = require('./memory');
-const { sendReply, setupGmailWatch } = require('./gmailService');
+const { generateProposedRules } = require('./ruleEngine');
+const { saveUserRules, saveToneProfile } = require('./memory');
+const { setupGmailWatch } = require('./gmailService');
 const logger = require('./logger');
 
 /**
@@ -14,9 +14,9 @@ async function initializeUserSetup(userEmail) {
   const calendarAnalysis = await analyze90DayHistory();
 
   // 2. Generate proposed rules
-  const proposedRules = generateProposedRules(calendarAnalysis);
+  const proposedRules = generateProposedRules(calendarAnalysis, 'Asia/Kolkata');
 
-  // 3. Save initial rules as draft/confirmed
+  // 3. Save initial rules as draft (unconfirmed)
   await saveUserRules(proposedRules);
 
   // 4. Default proposed tone
@@ -29,9 +29,10 @@ async function initializeUserSetup(userEmail) {
   await saveToneProfile(defaultTone);
 
   // 5. Attempt watch setup if topic provided
-  if (process.env.GMAIL_PUBSUB_TOPIC) {
+  const topicName = process.env.PUBSUB_TOPIC || process.env.GMAIL_PUBSUB_TOPIC;
+  if (topicName) {
     try {
-      await setupGmailWatch(process.env.GMAIL_PUBSUB_TOPIC);
+      await setupGmailWatch(topicName);
     } catch (err) {
       await logger.warn('SetupService', 'Could not enable Pub/Sub watch during setup', err.message);
     }

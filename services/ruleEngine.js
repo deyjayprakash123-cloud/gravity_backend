@@ -2,18 +2,28 @@ const { loadUserRules, saveUserRules } = require('./memory');
 
 const DEFAULT_RULES = {
   workingHours: {
-    start: '09:00',
-    end: '17:00',
-    timezone: 'America/New_York'
+    start: '09:30',
+    end: '18:30',
+    timezone: 'Asia/Kolkata'
   },
   buffers: {
-    beforeMinutes: 10,
-    afterMinutes: 10
+    beforeMinutes: 15,
+    afterMinutes: 15
   },
   noMeetingDays: ['Saturday', 'Sunday'],
-  maxMeetingsPerDay: 5,
+  holidays: [
+    '2026-01-26', // Republic Day
+    '2026-03-20', // Holi
+    '2026-04-14', // Ambedkar Jayanti
+    '2026-08-15', // Independence Day
+    '2026-10-02', // Gandhi Jayanti
+    '2026-10-21', // Diwali
+    '2026-12-25'  // Christmas
+  ],
+  maxMeetingsPerDay: 6,
   preferredDuration: 30,
-  preferredTimes: [10, 11, 14, 15]
+  preferredTimes: [10, 11, 14, 15, 16],
+  confirmed: false
 };
 
 /**
@@ -30,33 +40,35 @@ async function getEffectiveRules() {
 /**
  * Generate proposed rules based on 90-day calendar analysis
  */
-function generateProposedRules(analysis, userTimezone = 'America/New_York') {
+function generateProposedRules(analysis, userTimezone = 'Asia/Kolkata') {
   return {
     workingHours: {
-      start: analysis?.workingHours?.start || '09:00',
-      end: analysis?.workingHours?.end || '17:00',
+      start: analysis?.workingHours?.start || '09:30',
+      end: analysis?.workingHours?.end || '18:30',
       timezone: userTimezone
     },
     buffers: {
-      beforeMinutes: analysis?.suggestedBuffers?.beforeMinutes || 10,
-      afterMinutes: analysis?.suggestedBuffers?.afterMinutes || 10
+      beforeMinutes: analysis?.suggestedBuffers?.beforeMinutes || 15,
+      afterMinutes: analysis?.suggestedBuffers?.afterMinutes || 15
     },
     noMeetingDays: analysis?.noMeetingDays || ['Saturday', 'Sunday'],
-    maxMeetingsPerDay: analysis?.suggestedMaxMeetingsPerDay || 5,
+    holidays: analysis?.holidays || DEFAULT_RULES.holidays,
+    maxMeetingsPerDay: analysis?.suggestedMaxMeetingsPerDay || 6,
     preferredDuration: analysis?.preferredDuration || 30,
-    preferredTimes: analysis?.preferredHours || [10, 11, 14, 15]
+    preferredTimes: analysis?.preferredHours || [10, 11, 14, 15, 16],
+    confirmed: false
   };
 }
 
 /**
- * Check if a proposed time slot satisfies working hours, no-meeting days, and max daily meetings
+ * Check if a proposed time slot satisfies working hours, no-meeting days, holidays, and max daily meetings
  */
 function isSlotWithinRules(slotStartISO, slotEndISO, existingCountToday, rules) {
   const start = new Date(slotStartISO);
   const end = new Date(slotEndISO);
 
   // 1. Check max meetings per day
-  if (existingCountToday >= (rules.maxMeetingsPerDay || 5)) {
+  if (existingCountToday >= (rules.maxMeetingsPerDay || 6)) {
     return { valid: false, reason: 'Max daily meeting limit reached' };
   }
 
@@ -67,9 +79,15 @@ function isSlotWithinRules(slotStartISO, slotEndISO, existingCountToday, rules) 
     return { valid: false, reason: `Day ${dayName} is a no-meeting day` };
   }
 
-  // 3. Check working hours (in rule timezone or UTC local time)
-  const startHoursStr = rules.workingHours?.start || '09:00';
-  const endHoursStr = rules.workingHours?.end || '17:00';
+  // 3. Check Indian holidays
+  const dateStr = start.toISOString().split('T')[0];
+  if ((rules.holidays || []).includes(dateStr)) {
+    return { valid: false, reason: `Date ${dateStr} is a holiday` };
+  }
+
+  // 4. Check working hours (in rule timezone or UTC local time)
+  const startHoursStr = rules.workingHours?.start || '09:30';
+  const endHoursStr = rules.workingHours?.end || '18:30';
 
   const [wStartH, wStartM] = startHoursStr.split(':').map(Number);
   const [wEndH, wEndM] = endHoursStr.split(':').map(Number);
