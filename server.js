@@ -127,7 +127,7 @@ app.get('/oauth/callback', async (req, res) => {
       idToken: tokens.id_token,
       audience: process.env.GOOGLE_CLIENT_ID
     });
-    const userEmail = ticket.getPayload().email;
+    const userEmail = ticket.getPayload().email.toLowerCase().trim();
     
     console.log('👤 User email:', userEmail);
     
@@ -645,7 +645,7 @@ async function sendEmailReply(gmail, threadId, body) {
 // ============ USER API ROUTES ============
 
 app.get('/api/user/status', async (req, res) => {
-  const email = req.query.email;
+  const email = (req.query.email || '').toLowerCase().trim();
   if (!email) return res.status(400).json({ error: 'Email required' });
   
   const userDir = path.join(USERS_DIR, email);
@@ -667,7 +667,7 @@ app.get('/api/user/status', async (req, res) => {
 });
 
 app.get('/api/user/dashboard', async (req, res) => {
-  const email = req.query.email;
+  const email = (req.query.email || '').toLowerCase().trim();
   if (!email) return res.status(400).json({ error: 'Email required' });
   
   try {
@@ -710,7 +710,7 @@ app.get('/api/user/dashboard', async (req, res) => {
 });
 
 app.get('/api/user/rules', async (req, res) => {
-  const email = req.query.email;
+  const email = (req.query.email || '').toLowerCase().trim();
   if (!email) return res.status(400).json({ error: 'Email required' });
   
   const rulesPath = path.join(USERS_DIR, email, 'rules.json');
@@ -730,7 +730,7 @@ app.get('/api/user/rules', async (req, res) => {
 });
 
 app.post('/api/user/pause', async (req, res) => {
-  const email = req.body.email || req.query.email;
+  const email = (req.body.email || req.query.email || '').toLowerCase().trim();
   if (!email) return res.status(400).json({ error: 'Email required' });
   
   await fs.writeJson(path.join(USERS_DIR, email, 'paused.json'), { paused: true, pausedAt: new Date().toISOString() });
@@ -739,7 +739,7 @@ app.post('/api/user/pause', async (req, res) => {
 });
 
 app.post('/api/user/resume', async (req, res) => {
-  const email = req.body.email || req.query.email;
+  const email = (req.body.email || req.query.email || '').toLowerCase().trim();
   if (!email) return res.status(400).json({ error: 'Email required' });
   
   const pausePath = path.join(USERS_DIR, email, 'paused.json');
@@ -755,7 +755,7 @@ app.post('/api/user/resume', async (req, res) => {
 });
 
 app.post('/api/user/rules/confirm', async (req, res) => {
-  const email = req.body.email || req.query.email;
+  const email = (req.body.email || req.query.email || '').toLowerCase().trim();
   const rules = req.body.rules;
   if (!email || !rules) return res.status(400).json({ error: 'Email and rules required' });
   
