@@ -122,14 +122,79 @@ app.get('/oauth/callback', async (req, res) => {
       throw lastError || new Error('Failed token exchange with candidate URIs');
     }
     
-    // Get user email from id_token
-    const ticket = await oauth2Client.verifyIdToken({
-      idToken: tokens.id_token,
-      audience: process.env.GOOGLE_CLIENT_ID
-    });
-    const userEmail = ticket.getPayload().email.toLowerCase().trim();
+    console.log('Token keys:', Object.keys(tokens));
+    console.log('Has id_token:', !!tokens.id_token);
+    console.log('Has access_token:', !!tokens.access_token);
+    console.log('Has refresh_token:', !!tokens.refresh_token);
     
-    console.log('👤 User email:', userEmail);
+    let userEmail = null;
+    
+    // METHOD 1: Try verifyIdToken if id_token exists
+    if (tokens.id_token) {
+      try {
+        const ticket = await oauth2Client.verifyIdToken({
+          idToken: tokens.id_token,
+          audience: process.env.GOOGLE_CLIENT_ID
+        });
+        userEmail = ticket.getPayload().email;
+        console.log('✅ Email from id_token:', userEmail);
+      } catch (idErr) {
+        console.log('⚠️ verifyIdToken failed, trying alternative method...');
+        console.log('id_token error:', idErr.message);
+      }
+    }
+    
+    // METHOD 2: If no id_token, get email from Gmail API
+    if (!userEmail && tokens.access_token) {
+      try {
+        oauth2Client.setCredentials(tokens);
+        const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+        const profile = await gmail.users.getProfile({ userId: 'me' });
+        userEmail = profile.data.emailAddress;
+        console.log('✅ Email from Gmail API:', userEmail);
+      } catch (gmailErr) {
+        console.log('⚠️ Gmail profile fetch failed:', gmailErr.message);
+      }
+    }
+    
+    // METHOD 3: If still no email, get from People API
+    if (!userEmail && tokens.access_token) {
+      try {
+        oauth2Client.setCredentials(tokens);
+        const people = google.people({ version: 'v1', auth: oauth2Client });
+        const me = await people.people.get({
+          resourceName: 'people/me',
+          personFields: 'emailAddresses'
+        });
+        userEmail = me.data.emailAddresses?.[0]?.value;
+        console.log('✅ Email from People API:', userEmail);
+      } catch (peopleErr) {
+        console.log('⚠️ People API fetch failed:', peopleErr.message);
+      }
+    }
+    
+    // METHOD 4: Try to decode access token as JWT
+    if (!userEmail && tokens.access_token) {
+      try {
+        const parts = tokens.access_token.split('.');
+        if (parts.length === 3) {
+          const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+          userEmail = payload.email;
+          console.log('✅ Email from access token JWT:', userEmail);
+        }
+      } catch (jwtErr) {
+        console.log('⚠️ Could not decode access token');
+      }
+    }
+    
+    // If STILL no email, we cannot proceed
+    if (!userEmail) {
+      console.error('❌ FATAL: Cannot determine user email');
+      return res.redirect('https://gravity-frontend-rose.vercel.app?error=cannot_get_email');
+    }
+    
+    userEmail = userEmail.toLowerCase().trim();
+    console.log('👤 Final user email:', userEmail);
     
     // Create user directory
     const userDir = path.join(USERS_DIR, userEmail);
