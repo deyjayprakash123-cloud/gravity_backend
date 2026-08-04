@@ -476,21 +476,26 @@ async function processSingleEmail(userEmail, messageId, gmail, userDir) {
     }
     
     // CLASSIFY THE EMAIL
+    console.log('📧 Processing:', subject);
+    console.log('   From:', from);
     console.log('🤖 Classifying with AI...');
-    const classification = await classifyEmail(body, subject);
+    const classification = await classifyEmail(body, subject, from);
     console.log('📊 Classification result:', JSON.stringify(classification));
     
     if (classification.intent === 'NOT_SCHEDULING') {
-      console.log('📝 Not a meeting request, leaving in inbox');
+      console.log('⏭️ SKIPPED:', classification.reason || 'not_scheduling');
       return;
     }
     
     if (classification.intent === 'SCHEDULING') {
-      console.log('🎯 MEETING REQUEST DETECTED! Finding slots...');
+      console.log('🎯 GENUINE MEETING REQUEST DETECTED!');
+      console.log('   Topic:', classification.extractedTopic);
+      console.log('   Urgency:', classification.urgency);
+      console.log('   Sender type:', classification.senderType);
       
       // Find available slots
       const slots = findAvailableSlotsSimple();
-      console.log('📅 Generated slots:', slots.length);
+      console.log('📅 Generated', slots.length, 'slots');
       
       if (slots.length === 0) {
         console.log('❌ No slots available');
@@ -501,15 +506,15 @@ async function processSingleEmail(userEmail, messageId, gmail, userDir) {
       const tonePath = path.join(userDir, 'tone.json');
       const tone = await fs.pathExists(tonePath) ? await fs.readJson(tonePath) : { greeting: 'Hi', signOff: 'Best' };
       
-      // Generate reply
-      console.log('✍️ Generating reply...');
-      const replyBody = await generateReply(from, slots, tone, body);
-      console.log('📤 Reply generated:', replyBody.substring(0, 100));
+      // Generate PERSONALIZED reply
+      console.log('✍️ Generating personalized reply...');
+      const replyBody = await generateReply(from, slots, tone, body, subject, classification);
+      console.log('📤 Reply:', replyBody.substring(0, 150) + '...');
       
-      // Send reply - PASS THE FROM ADDRESS
-      console.log('📤 Sending reply to:', from);
+      // Send reply
+      console.log('📤 Sending to:', from);
       await sendEmailReply(gmail, threadId, replyBody, from, subject);
-      console.log('✅ REPLY SENT SUCCESSFULLY!');
+      console.log('✅ PERSONALIZED REPLY SENT!');
       
       // Save thread state
       const threadData = {
@@ -517,6 +522,8 @@ async function processSingleEmail(userEmail, messageId, gmail, userDir) {
         state: 'PROPOSED',
         senderEmail: from,
         subject,
+        topic: classification.extractedTopic || subject,
+        urgency: classification.urgency,
         proposedSlots: slots,
         history: [{
           timestamp: new Date().toISOString(),
@@ -543,7 +550,7 @@ async function processSingleEmail(userEmail, messageId, gmail, userDir) {
           timestamp: new Date().toISOString(),
           action: 'PROPOSED',
           senderEmail: from,
-          details: `Proposed ${slots.length} time slots`,
+          details: `Proposed ${slots.length} slots for ${classification.extractedTopic || subject}`,
           threadId
         });
         stats.recentActivity = stats.recentActivity.slice(0, 50);
@@ -561,25 +568,111 @@ async function processSingleEmail(userEmail, messageId, gmail, userDir) {
 
 // ============ AI FUNCTIONS ============
 
-async function classifyEmail(body, subject) {
+async function classifyEmail(body, subject, from) {
+  console.log('🤖 Classifying email with full context...');
+  
+  // QUICK PRE-FILTER: Check for obvious non-scheduling emails BEFORE calling AI
+  const bodyLower = (body + ' ' + subject).toLowerCase();
+  const fromLower = (from || '').toLowerCase();
+  
+  // List of promotional/ad/spam patterns
+  const promotionalPatterns = [
+    'unsubscribe', 'newsletter', 'offer', 'discount', 'sale', 'buy now',
+    'limited time', 'free trial', 'click here', 'act now', 'special promotion',
+    'exclusive deal', 'save up to', 'order now', 'shop now', 'best seller',
+    'noreply@', 'no-reply@', 'donotreply@', 'notification@', 'alert@',
+    'marketing@', 'sales@', 'promo@', 'info@', 'news@', 'updates@',
+    'your weekly', 'your monthly', 'digest', 'roundup', 'recap',
+    'thank you for your purchase', 'order confirmation', 'receipt',
+    'shipping confirmation', 'delivery update', 'track your',
+    'you have been selected', 'congratulations you', 'you won',
+    'social media', 'linkedin notification', 'facebook notification',
+    'twitter notification', 'instagram notification', 'new follower',
+    'mentioned you', 'tagged you', 'commented on', 'liked your'
+  ];
+  
+  const isPromotional = promotionalPatterns.some(pattern => 
+    bodyLower.includes(pattern) || subject.toLowerCase().includes(pattern) || fromLower.includes(pattern)
+  );
+  
+  if (isPromotional) {
+    console.log('🛑 Pre-filtered as PROMOTIONAL/AD - skipping');
+    return { intent: 'NOT_SCHEDULING', confidence: 0.99, reason: 'promotional_or_ad' };
+  }
+  
+  // Check for automated/system emails
+  const automatedPatterns = [
+    'automated message', 'do not reply', 'this is an automated',
+    'please do not reply', 'auto-generated', 'system notification',
+    'password reset', 'verification code', 'security alert',
+    'login attempt', 'new sign-in', 'account update'
+  ];
+  
+  const isAutomated = automatedPatterns.some(pattern => bodyLower.includes(pattern));
+  
+  if (isAutomated) {
+    console.log('🛑 Pre-filtered as AUTOMATED/SYSTEM - skipping');
+    return { intent: 'NOT_SCHEDULING', confidence: 0.99, reason: 'automated_email' };
+  }
+  
+  // NOW call AI for deeper understanding
   try {
-    console.log('🔄 Calling OpenRouter API for classification...');
+    console.log('🔄 Calling AI for deep classification...');
     
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
-        model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+        model: 'meta-llama/llama-3-8b-instruct:free',
         messages: [
           {
             role: 'system',
-            content: 'You classify emails. Return ONLY valid JSON: {"intent":"SCHEDULING","confidence":0.95} or {"intent":"NOT_SCHEDULING","confidence":0.95}. SCHEDULING means the sender wants to schedule a meeting/call/discussion at a specific time. NOT_SCHEDULING means newsletter, notification, casual chat, or anything not asking to meet.'
+            content: `You are an expert email classifier. Your job is to read emails carefully and determine if the sender genuinely wants to schedule a meeting/call/discussion.
+
+Return ONLY a valid JSON object with these fields:
+{
+  "intent": "SCHEDULING" | "NOT_SCHEDULING" | "UNCERTAIN",
+  "confidence": 0.0 to 1.0,
+  "reason": "brief explanation of your decision",
+  "extractedTopic": "the topic/purpose of the meeting if scheduling, otherwise null",
+  "extractedDuration": "requested duration in minutes if mentioned, otherwise null",
+  "urgency": "high" | "medium" | "low",
+  "senderType": "colleague" | "client" | "friend" | "stranger" | "recruiter" | "service"
+}
+
+SCHEDULING means:
+- Someone explicitly asks to meet, schedule a call, discuss something at a specific time
+- Someone asks about your availability for a meeting
+- Someone wants to "catch up", "chat", "discuss", "connect" with clear intent to schedule
+- Someone proposes specific dates/times
+- A recruiter wants to schedule an interview
+- A client wants to discuss a project
+
+NOT_SCHEDULING means:
+- Newsletters, promotions, ads, marketing emails
+- Automated notifications, alerts, system messages
+- Casual "how are you" without meeting intent
+- Thank you notes, confirmations of things already scheduled
+- Information sharing without meeting request
+- Calendar invites already sent (these are handled by Google Calendar)
+
+UNCERTAIN means:
+- Vague "let's talk sometime" without any concrete ask
+- Hard to tell if they want to meet or just chatting
+- Mixed signals`
           },
           {
             role: 'user',
-            content: `Subject: ${subject}\n\nBody: ${body.substring(0, 800)}`
+            content: `Analyze this email carefully:
+
+FROM: ${from}
+SUBJECT: ${subject}
+BODY:
+${body.substring(0, 1500)}
+
+Does this person genuinely want to schedule a meeting? Extract the topic, duration, and urgency if they do.`
           }
         ],
-        max_tokens: 80,
+        max_tokens: 250,
         temperature: 0.1
       },
       {
@@ -587,36 +680,41 @@ async function classifyEmail(body, subject) {
           'Authorization': 'Bearer ' + process.env.OPENROUTER_API_KEY,
           'Content-Type': 'application/json'
         },
-        timeout: 15000
+        timeout: 20000
       }
     );
     
     const content = response.data.choices[0].message.content;
-    console.log('🤖 AI response:', content);
+    console.log('🤖 AI Classification:', content);
     
-    // Extract JSON
+    // Extract JSON from response
     const match = content.match(/\{[\s\S]*\}/);
     if (match) {
-      return JSON.parse(match[0]);
+      const result = JSON.parse(match[0]);
+      console.log('✅ Classification:', result.intent, '-', result.reason);
+      return result;
     }
     
-    return { intent: 'NOT_SCHEDULING', confidence: 0.5 };
+    return { intent: 'NOT_SCHEDULING', confidence: 0.5, reason: 'ai_parse_failed' };
     
   } catch (err) {
-    console.error('❌ Classification error:', err.message);
+    console.error('❌ AI classification error:', err.message);
     
-    // Check for credit exhaustion
-    if (err.response?.status === 402 || (err.response?.data?.error?.message || '').includes('credits')) {
-      console.error('⚠️⚠️⚠️ OPENROUTER CREDITS EXHAUSTED ⚠️⚠️⚠️');
-      console.error('Contact: deyjayprakash123@gmail.com');
-    }
+    // Fallback keyword detection
+    const meetingKeywords = [
+      'meet', 'meeting', 'schedule', 'call', 'catch up', 'discuss',
+      'availability', 'calendar', 'free for', 'let\'s connect',
+      'when can we', 'are you available', 'what time works',
+      'set up a', 'book a', 'schedule a', 'find time'
+    ];
     
-    // Fallback: simple keyword check
-    const meetingWords = ['meet', 'meeting', 'call', 'schedule', 'catch up', 'discuss', 'calendar', 'availability', 'free', 'time', 'slot'];
-    const bodyLower = (body + ' ' + subject).toLowerCase();
-    const hasMeetingWords = meetingWords.some(word => bodyLower.includes(word));
+    const hasMeetingIntent = meetingKeywords.some(kw => bodyLower.includes(kw));
     
-    return { intent: hasMeetingWords ? 'SCHEDULING' : 'NOT_SCHEDULING', confidence: 0.4 };
+    return {
+      intent: hasMeetingIntent ? 'SCHEDULING' : 'NOT_SCHEDULING',
+      confidence: 0.4,
+      reason: 'keyword_fallback'
+    };
   }
 }
 
@@ -666,48 +764,111 @@ function findAvailableSlotsSimple() {
   return slots.slice(0, 3);
 }
 
-async function generateReply(from, slots, tone, originalBody) {
-  const name = from.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+async function generateReply(from, slots, tone, emailBody, subject, classification) {
+  const name = extractName(from);
+  const topic = (classification && classification.extractedTopic) || subject || 'discussion';
+  const duration = (classification && classification.extractedDuration) || 30;
   
   const slotLines = slots.map((s, i) => 
-    `${i + 1}. ${s.day}, ${s.date} at ${s.startTime} - ${s.endTime} IST`
+    `${i + 1}. ${s.day}, ${s.date} at ${s.startTime} - ${s.endTime} IST (${duration} min)`
   ).join('\n');
+  
+  console.log('✍️ Generating personalized reply...');
+  console.log('   Topic:', topic);
+  console.log('   Name:', name);
+  console.log('   Sender type:', classification?.senderType);
   
   try {
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
-        model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+        model: 'mistralai/mistral-7b-instruct',
         messages: [
           {
             role: 'system',
-            content: `Write a brief, friendly email reply to schedule a meeting. Use "${tone.greeting}" as greeting style. Sign off with "${tone.signOff}". Keep it 3-4 sentences maximum. Be warm but professional.`
+            content: `You are a personal assistant writing a genuine, human-like email reply. 
+
+CRITICAL RULES:
+- READ the original email carefully and reference it naturally
+- Mention the topic they want to discuss
+- Sound like a real person, not a template
+- Be warm but professional
+- Use "${tone.greeting}" as greeting style
+- Sign off with "${tone.signOff}"
+- Keep it 3-5 sentences
+- DON'T sound robotic or generic
+- Reference something specific from their email
+- If they mention urgency, acknowledge it
+- Adapt tone based on sender: more casual for friends, more formal for clients
+
+The available time slots are in IST (Indian Standard Time).`
           },
           {
             role: 'user',
-            content: `Write to ${name}. Propose these meeting times (all in IST):\n${slotLines}\n\nAsk them to pick one slot that works for them. Keep it short and friendly.`
+            content: `Write a reply to ${name}.
+
+Original email subject: "${subject}"
+Original email body: "${emailBody.substring(0, 500)}"
+Topic they want to discuss: ${topic}
+Sender type: ${classification?.senderType || 'unknown'}
+
+Propose these meeting times (all in IST):
+${slotLines}
+
+Make the reply sound natural and reference their email. Don't just list times - acknowledge what they wrote about.`
           }
         ],
-        max_tokens: 200,
-        temperature: 0.7
+        max_tokens: 300,
+        temperature: 0.8
       },
       {
         headers: {
           'Authorization': 'Bearer ' + process.env.OPENROUTER_API_KEY,
           'Content-Type': 'application/json'
         },
-        timeout: 15000
+        timeout: 20000
       }
     );
     
-    return response.data.choices[0].message.content;
+    const reply = response.data.choices[0].message.content;
+    console.log('✅ Generated personalized reply');
+    return reply;
     
   } catch (err) {
-    console.error('❌ Reply generation error, using template');
+    console.error('❌ AI reply generation failed, using smart template');
     
-    // Template fallback
-    return `${tone.greeting} ${name},\n\nThanks for reaching out! I'd love to meet. Here are some times that work for me (IST):\n\n${slotLines}\n\nLet me know which works best for you.\n\n${tone.signOff}`;
+    // SMART FALLBACK - still personalized
+    const urgencyNote = (classification && classification.urgency === 'high') ? 'I understand this is time-sensitive. ' : '';
+    const topicRef = topic !== 'discussion' ? ` regarding ${topic}` : '';
+    
+    return `${tone.greeting} ${name},
+
+Thanks for reaching out${topicRef}! ${urgencyNote}I'd be happy to connect. Here are some times that work for me (IST):
+
+${slotLines}
+
+Let me know which slot works best for you.
+
+${tone.signOff}`;
   }
+}
+
+// Helper function to extract name from email
+function extractName(from) {
+  if (!from) return 'there';
+  // Try "Name <email>" format first
+  const nameMatch = from.match(/^"?([^"<]+)"?\s*</);
+  if (nameMatch) {
+    return nameMatch[1].trim().split(' ')[0]; // First name only
+  }
+  
+  // Fallback: extract from email
+  const emailPart = from.match(/([^@]+)@/);
+  if (emailPart) {
+    return emailPart[1].replace(/[._]/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).split(' ')[0];
+  }
+  
+  return 'there';
 }
 
 async function sendEmailReply(gmail, threadId, body, recipientEmail, originalSubject) {
