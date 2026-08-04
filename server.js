@@ -992,6 +992,44 @@ app.post('/api/user/reset-processed', async (req, res) => {
   res.json({ success: true, message: 'Reset complete. Only new emails will be processed.' });
 });
 
+// ActivePieces marketplace introspect endpoint
+app.get('/api/marketplace/introspect', (req, res) => {
+  res.json({
+    name: "Gravity Meeting Scheduler",
+    version: "1.0.0",
+    description: "Autonomous AI agent that handles meeting scheduling emails 24/7",
+    author: {
+      name: "Jayaprakash Dey",
+      email: "deyjayprakash123@gmail.com"
+    },
+    capabilities: [
+      "email_classification",
+      "calendar_availability",
+      "slot_proposal",
+      "auto_reply",
+      "meeting_booking",
+      "conversation_tracking"
+    ],
+    integrations: ["gmail", "google-calendar", "openrouter"],
+    status: "active",
+    url: "https://gravity-backend-rdvr.onrender.com",
+    frontend: "https://gravity-frontend-rose.vercel.app"
+  });
+});
+
+app.post('/api/marketplace/introspect', (req, res) => {
+  res.json({
+    valid: true,
+    name: "Gravity Meeting Scheduler",
+    status: "operational",
+    endpoints: {
+      webhook: "/webhook/gmail",
+      health: "/health",
+      dashboard: "/api/user/dashboard"
+    }
+  });
+});
+
 app.get('/api/user/dashboard', async (req, res) => {
   const email = (req.query.email || '').toLowerCase().trim();
   if (!email) return res.status(400).json({ error: 'Email required' });
