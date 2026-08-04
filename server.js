@@ -58,9 +58,10 @@ app.get('/health', (req, res) => {
 
 // Generate OAuth URL
 app.get('/api/auth/url', (req, res) => {
+  const redirectUri = req.query.redirect_uri || 'https://gravity-frontend-rose.vercel.app/oauth/callback';
   const url = 'https://accounts.google.com/o/oauth2/v2/auth' +
     '?client_id=' + process.env.GOOGLE_CLIENT_ID +
-    '&redirect_uri=' + encodeURIComponent('https://gravity-backend-rdvr.onrender.com/oauth/callback') +
+    '&redirect_uri=' + encodeURIComponent(redirectUri) +
     '&response_type=code' +
     '&scope=' + encodeURIComponent('https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly') +
     '&access_type=offline' +
@@ -87,18 +88,39 @@ app.get('/oauth/callback', async (req, res) => {
   }
   
   try {
-    // Create OAuth client
-    const oauth2Client = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET,
-      'https://gravity-backend-rdvr.onrender.com/oauth/callback'
-    );
+    const candidateUris = [
+      'https://gravity-frontend-rose.vercel.app/oauth/callback',
+      'https://gravity-backend-rdvr.onrender.com/oauth/callback',
+      'http://localhost:3000/oauth/callback'
+    ];
     
-    console.log('🔄 Exchanging code for tokens...');
+    let tokens = null;
+    let oauth2Client = null;
+    let lastError = null;
+
+    console.log('🔄 Exchanging code for tokens across candidate URIs...');
     
-    // Exchange code for tokens
-    const { tokens } = await oauth2Client.getToken(code);
-    console.log('✅ Tokens received');
+    for (const uri of candidateUris) {
+      try {
+        const client = new google.auth.OAuth2(
+          process.env.GOOGLE_CLIENT_ID,
+          process.env.GOOGLE_CLIENT_SECRET,
+          uri
+        );
+        const tokenRes = await client.getToken(code);
+        tokens = tokenRes.tokens;
+        oauth2Client = client;
+        console.log(`✅ Tokens received using redirect_uri: ${uri}`);
+        break;
+      } catch (err) {
+        lastError = err;
+        console.log(`⚠️ Token exchange failed with ${uri}: ${err.message}`);
+      }
+    }
+
+    if (!tokens || !oauth2Client) {
+      throw lastError || new Error('Failed token exchange with candidate URIs');
+    }
     
     // Get user email from id_token
     const ticket = await oauth2Client.verifyIdToken({
