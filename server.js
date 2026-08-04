@@ -293,32 +293,51 @@ app.get('/oauth/callback', async (req, res) => {
 // ============ EMAIL PROCESSING ENGINE ============
 
 async function processEmailsForUser(userEmail) {
-  console.log(`\n📬 ========== CHECKING EMAILS FOR: ${userEmail} ==========`);
+  console.log(`\n📬 ========== CHECKING: ${userEmail} ==========`);
+  console.log(`⏰ Time: ${new Date().toLocaleString('en-IN', { timeZone: TIMEZONE })}`);
   
   try {
-    // Check if user exists
     const userDir = path.join(USERS_DIR, userEmail);
+    
+    // Check all prerequisites
     if (!await fs.pathExists(userDir)) {
-      console.log('❌ User directory not found');
+      console.log('❌ User directory missing');
       return;
     }
     
-    // Check if paused
-    const pausePath = path.join(userDir, 'paused.json');
-    if (await fs.pathExists(pausePath)) {
-      console.log('⏸️ Scheduler is PAUSED for', userEmail);
+    const pausedPath = path.join(userDir, 'paused.json');
+    if (await fs.pathExists(pausedPath)) {
+      console.log('⏸️ Scheduler PAUSED');
       return;
     }
     
-    // Check tokens
     const tokensPath = path.join(userDir, 'tokens.json');
     if (!await fs.pathExists(tokensPath)) {
-      console.log('❌ No tokens found');
+      console.log('❌ No tokens file');
       return;
     }
     
-    const tokens = await fs.readJson(tokensPath);
-    console.log('✅ Tokens loaded');
+    const rulesPath = path.join(userDir, 'rules.json');
+    if (!await fs.pathExists(rulesPath)) {
+      console.log('❌ No rules file');
+      return;
+    }
+    
+    const rules = await fs.readJson(rulesPath);
+    if (!rules.confirmed) {
+      console.log('❌ Rules not confirmed. Run setup first.');
+      return;
+    }
+    
+    // Load tokens
+    let tokens;
+    try {
+      tokens = await fs.readJson(tokensPath);
+      console.log('✅ Tokens loaded');
+    } catch (err) {
+      console.log('❌ Invalid tokens file');
+      return;
+    }
     
     // Create Gmail client
     const oauth2Client = new google.auth.OAuth2(
@@ -327,38 +346,45 @@ async function processEmailsForUser(userEmail) {
       'https://gravity-backend-rdvr.onrender.com/oauth/callback'
     );
     oauth2Client.setCredentials(tokens);
+    
+    // Test the connection first
+    try {
+      const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+      const profile = await gmail.users.getProfile({ userId: 'me' });
+      console.log('✅ Gmail connected as:', profile.data.emailAddress);
+    } catch (authErr) {
+      console.log('❌ Gmail auth failed:', authErr.message);
+      return;
+    }
+    
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     
-    // Get service start time from stats
-    const statsPath = path.join(userDir, 'stats.json');
-    let serviceStartTime = new Date().toISOString();
-    if (await fs.pathExists(statsPath)) {
-      const stats = await fs.readJson(statsPath);
-      serviceStartTime = stats.serviceStartedAt || new Date().toISOString();
-    }
-    console.log('🕐 Service started at:', serviceStartTime);
-    
-    // Search for unread emails received AFTER service start
-    const afterTimestamp = Math.floor(new Date(serviceStartTime).getTime() / 1000);
-    
+    // Search for unread emails - SIMPLIFIED QUERY
     console.log('🔍 Searching for unread emails...');
     
-    const messagesResponse = await gmail.users.messages.list({
-      userId: 'me',
-      q: `is:unread -from:me after:${afterTimestamp}`,
-      maxResults: 10
-    });
+    let messagesResponse;
+    try {
+      // Try simple query first
+      messagesResponse = await gmail.users.messages.list({
+        userId: 'me',
+        q: 'is:unread -from:me',
+        maxResults: 10
+      });
+    } catch (searchErr) {
+      console.log('❌ Email search failed:', searchErr.message);
+      return;
+    }
     
     const messages = messagesResponse.data.messages || [];
     console.log(`📧 Found ${messages.length} unread messages`);
     
     if (messages.length === 0) {
-      console.log('📭 No new unread messages to process');
+      console.log('📭 No unread messages');
       console.log('========================================\n');
       return;
     }
     
-    // Process each message
+    // Process messages...
     for (const msg of messages) {
       await processSingleEmail(userEmail, msg.id, gmail, userDir);
     }
@@ -366,8 +392,7 @@ async function processEmailsForUser(userEmail) {
     console.log('========================================\n');
     
   } catch (err) {
-    console.error('❌ Email processing error:', err.message);
-    console.error('Full error:', err);
+    console.error('❌ processEmailsForUser error:', err.message);
   }
 }
 
@@ -924,21 +949,120 @@ app.get('/api/global/users', async (req, res) => {
   }
 });
 
-// ============ GLOBAL SCHEDULER - Checks all users every 2 minutes ============
-cron.schedule('*/2 * * * *', async () => {
+// Manual trigger for email checking
+app.post('/api/user/check-emails', async (req, res) => {
+  const email = (req.body?.email || req.query?.email || '').toLowerCase().trim();
+  if (!email) return res.status(400).json({ error: 'Email required' });
+  
+  console.log('🔍 Manual email check triggered for:', email);
+  
   try {
-    const usersListPath = path.join(DATA_DIR, 'global', 'users-list.json');
-    if (!await fs.pathExists(usersListPath)) return;
+    await processEmailsForUser(email);
+    res.json({ success: true, message: 'Email check completed' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Debug endpoint to check user state
+app.get('/api/user/debug', async (req, res) => {
+  const email = (req.query.email || '').toLowerCase().trim();
+  if (!email) return res.status(400).json({ error: 'Email required' });
+  
+  const userDir = path.join(USERS_DIR, email);
+  
+  const debug = {
+    email,
+    userDirExists: await fs.pathExists(userDir),
+    tokensExist: await fs.pathExists(path.join(userDir, 'tokens.json')),
+    rulesExist: await fs.pathExists(path.join(userDir, 'rules.json')),
+    statsExist: await fs.pathExists(path.join(userDir, 'stats.json')),
+    pausedExist: await fs.pathExists(path.join(userDir, 'paused.json')),
+    threadsDirExists: await fs.pathExists(path.join(userDir, 'threads')),
+  };
+  
+  // Get rules if they exist
+  if (debug.rulesExist) {
+    const rules = await fs.readJson(path.join(userDir, 'rules.json'));
+    debug.rulesConfirmed = rules.confirmed;
+    debug.rules = rules;
+  }
+  
+  // Get stats if they exist
+  if (debug.statsExist) {
+    const stats = await fs.readJson(path.join(userDir, 'stats.json'));
+    debug.serviceStartedAt = stats.serviceStartedAt;
+    debug.emailsHandled = stats.totalEmailsHandled;
+  }
+  
+  // Count threads
+  if (debug.threadsDirExists) {
+    const files = await fs.readdir(path.join(userDir, 'threads'));
+    debug.threadCount = files.filter(f => f.endsWith('.json')).length;
+  }
+  
+  // Count processed emails
+  const processedDir = path.join(userDir, 'processed');
+  if (await fs.pathExists(processedDir)) {
+    const files = await fs.readdir(processedDir);
+    debug.processedCount = files.filter(f => f.endsWith('.json')).length;
+  }
+  
+  res.json(debug);
+});
+
+// Helper to get all registered users
+async function getGlobalUserList() {
+  const userSet = new Set();
+  const usersListPath = path.join(DATA_DIR, 'global', 'users-list.json');
+  if (await fs.pathExists(usersListPath)) {
+    const list = await fs.readJson(usersListPath);
+    (list || []).forEach(u => userSet.add(u.toLowerCase().trim()));
+  }
+  if (await fs.pathExists(USERS_DIR)) {
+    const dirs = await fs.readdir(USERS_DIR);
+    for (const d of dirs) {
+      if (d.includes('@')) userSet.add(d.toLowerCase().trim());
+    }
+  }
+  return Array.from(userSet);
+}
+
+// ============ GLOBAL SCHEDULER - Run immediately on startup & every 2 mins ============
+console.log('🔄 Scheduling initial email check for all users...');
+setTimeout(async () => {
+  try {
+    const users = await getGlobalUserList();
+    if (users.length > 0) {
+      console.log(`📬 Startup check: Found ${users.length} users, checking emails...`);
+      for (const email of users) {
+        await processEmailsForUser(email);
+      }
+    }
+  } catch (err) {
+    console.error('Initial check error:', err.message);
+  }
+}, 5000); // Run 5 seconds after startup
+
+cron.schedule('*/2 * * * *', async () => {
+  console.log(`\n🔄 [${new Date().toISOString()}] SCHEDULER: Checking all users...`);
+  try {
+    const users = await getGlobalUserList();
+    if (users.length === 0) {
+      console.log('📭 No users found');
+      return;
+    }
     
-    const users = await fs.readJson(usersListPath);
-    console.log(`\n🔄 [SCHEDULER] Checking emails for ${users.length} users...`);
+    console.log(`👥 ${users.length} users in list`);
     
     for (const email of users) {
+      console.log(`\n📧 Checking: ${email}`);
       await processEmailsForUser(email);
     }
   } catch (err) {
-    console.error('Scheduler error:', err.message);
+    console.error('❌ Scheduler error:', err.message);
   }
+  console.log('✅ Scheduler cycle complete\n');
 });
 
 // Keep-alive
