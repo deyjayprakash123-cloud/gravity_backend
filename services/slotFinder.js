@@ -1,25 +1,81 @@
 const { checkFreeBusy } = require('./calendarService');
-const { getEffectiveRules, isSlotWithinRules } = require('./ruleEngine');
+const { getUserRules } = require('./userManager');
 const logger = require('./logger');
 
-/**
- * Finds top candidate meeting slots that adhere to user rules & calendar availability
- */
-async function findAvailableSlots({ durationMinutes = 30, daysAhead = 7, senderTimezone = null, constraints = [] }) {
-  const rules = await getEffectiveRules();
-  const userTz = rules.workingHours.timezone || 'Asia/Kolkata';
-  const targetTz = senderTimezone || userTz;
+const DEFAULT_RULES = {
+  workingHours: { start: '09:30', end: '18:30', timezone: 'Asia/Kolkata' },
+  buffers: { beforeMinutes: 15, afterMinutes: 15 },
+  noMeetingDays: ['Saturday', 'Sunday'],
+  holidays: [
+    '2026-01-26',
+    '2026-03-20',
+    '2026-04-14',
+    '2026-08-15',
+    '2026-10-02',
+    '2026-10-21',
+    '2026-12-25'
+  ],
+  maxMeetingsPerDay: 6,
+  preferredDuration: 30,
+  preferredTimes: [10, 11, 14, 15, 16],
+  confirmed: true
+};
+
+async function getEffectiveUserRules(userEmail) {
+  const rules = await getUserRules(userEmail);
+  if (rules) {
+    return { ...DEFAULT_RULES, ...rules };
+  }
+  return DEFAULT_RULES;
+}
+
+function isSlotWithinRules(slotStartISO, slotEndISO, existingCountToday, rules) {
+  const start = new Date(slotStartISO);
+  const end = new Date(slotEndISO);
+
+  if (existingCountToday >= (rules.maxMeetingsPerDay || 6)) {
+    return { valid: false, reason: 'Max daily meeting limit reached' };
+  }
+
+  const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const dayName = dayNames[start.getDay()];
+  if ((rules.noMeetingDays || []).includes(dayName)) {
+    return { valid: false, reason: `Day ${dayName} is a no-meeting day` };
+  }
+
+  const dateStr = start.toISOString().split('T')[0];
+  if ((rules.holidays || []).includes(dateStr)) {
+    return { valid: false, reason: `Date ${dateStr} is a holiday` };
+  }
+
+  const startHoursStr = rules.workingHours?.start || '09:30';
+  const endHoursStr = rules.workingHours?.end || '18:30';
+
+  const [wStartH, wStartM] = startHoursStr.split(':').map(Number);
+  const [wEndH, wEndM] = endHoursStr.split(':').map(Number);
+
+  const slotStartMinutes = start.getHours() * 60 + start.getMinutes();
+  const slotEndMinutes = end.getHours() * 60 + end.getMinutes();
+
+  const ruleStartMinutes = wStartH * 60 + (wStartM || 0);
+  const ruleEndMinutes = wEndH * 60 + (wEndM || 0);
+
+  if (slotStartMinutes < ruleStartMinutes || slotEndMinutes > ruleEndMinutes) {
+    return { valid: false, reason: 'Slot falls outside configured working hours' };
+  }
+
+  return { valid: true };
+}
+
+async function findAvailableSlots({ userEmail, durationMinutes = 30, daysAhead = 7 }) {
+  const rules = await getEffectiveUserRules(userEmail);
+  const userTz = rules.workingHours?.timezone || 'Asia/Kolkata';
 
   const now = new Date();
-  const searchStart = new Date(now.getTime() + 2 * 60 * 60 * 1000); // at least 2 hours from now
+  const searchStart = new Date(now.getTime() + 2 * 60 * 60 * 1000);
   const searchEnd = new Date(now.getTime() + daysAhead * 24 * 60 * 60 * 1000);
 
-  // Fetch busy events from calendar
-  const busyList = await checkFreeBusy({
-    timeMin: searchStart.toISOString(),
-    timeMax: searchEnd.toISOString(),
-    timeZone: userTz
-  });
+  const busyList = await checkFreeBusy(userEmail, searchStart.toISOString(), searchEnd.toISOString(), userTz);
 
   const candidates = [];
   const bufferBeforeMs = (rules.buffers?.beforeMinutes || 15) * 60 * 1000;
@@ -27,7 +83,6 @@ async function findAvailableSlots({ durationMinutes = 30, daysAhead = 7, senderT
   const slotDurationMs = durationMinutes * 60 * 1000;
 
   const dailyCounts = {};
-
   let currentDay = new Date(searchStart);
 
   while (currentDay < searchEnd) {
@@ -35,7 +90,6 @@ async function findAvailableSlots({ durationMinutes = 30, daysAhead = 7, senderT
     const dayName = dayNames[currentDay.getDay()];
     const dateStr = currentDay.toISOString().split('T')[0];
 
-    // Check no-meeting days and Indian holidays
     if (!rules.noMeetingDays.includes(dayName) && !(rules.holidays || []).includes(dateStr)) {
       const [startH, startM] = (rules.workingHours.start || '09:30').split(':').map(Number);
       const [endH, endM] = (rules.workingHours.end || '18:30').split(':').map(Number);
@@ -52,11 +106,9 @@ async function findAvailableSlots({ durationMinutes = 30, daysAhead = 7, senderT
         const candidateStart = new Date(slotPtr);
         const candidateEnd = new Date(slotPtr.getTime() + slotDurationMs);
 
-        // Include buffers when checking calendar overlap
         const bufferedStart = new Date(candidateStart.getTime() - bufferBeforeMs);
         const bufferedEnd = new Date(candidateEnd.getTime() + bufferAfterMs);
 
-        // Check busy overlaps
         const isOverlap = busyList.some(busy => {
           const bStart = new Date(busy.start);
           const bEnd = new Date(busy.end);
@@ -72,26 +124,23 @@ async function findAvailableSlots({ durationMinutes = 30, daysAhead = 7, senderT
           let score = 10;
           const startHour = candidateStart.getHours();
 
-          if ((rules.preferredTimes || []).includes(startHour)) {
-            score += 15;
-          }
+          if ((rules.preferredTimes || []).includes(startHour)) score += 15;
 
-          if (startHour === 10 || startHour === 11 || startHour === 15) {
-            score += 5;
-          }
+          const optionsDate = { weekday: 'short', month: 'short', day: 'numeric', timeZone: userTz };
+          const optionsTime = { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: userTz };
 
           candidates.push({
             startISO: candidateStart.toISOString(),
             endISO: candidateEnd.toISOString(),
-            dayName,
-            hour: startHour,
+            day: candidateStart.toLocaleDateString('en-IN', { weekday: 'short', timeZone: userTz }),
+            date: candidateStart.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', timeZone: userTz }),
+            startTime: candidateStart.toLocaleTimeString('en-IN', optionsTime),
+            endTime: candidateEnd.toLocaleTimeString('en-IN', optionsTime),
             score,
-            formattedUserTz: formatSlotTime(candidateStart, candidateEnd, userTz),
-            formattedSenderTz: formatSlotTime(candidateStart, candidateEnd, targetTz)
+            formattedText: `${candidateStart.toLocaleDateString('en-IN', optionsDate)} from ${candidateStart.toLocaleTimeString('en-IN', optionsTime)} to ${candidateEnd.toLocaleTimeString('en-IN', optionsTime)} IST`
           });
         }
 
-        // Advance by 30-minute steps
         slotPtr = new Date(slotPtr.getTime() + 30 * 60 * 1000);
       }
     }
@@ -100,35 +149,13 @@ async function findAvailableSlots({ durationMinutes = 30, daysAhead = 7, senderT
     currentDay.setHours(0, 0, 0, 0);
   }
 
-  if (candidates.length < 3 && daysAhead < 14) {
-    await logger.info('SlotFinder', `Only found ${candidates.length} slots in ${daysAhead} days. Expanding search to 14 days.`);
-    return findAvailableSlots({ durationMinutes, daysAhead: 14, senderTimezone, constraints });
-  }
-
   candidates.sort((a, b) => b.score - a.score || new Date(a.startISO) - new Date(b.startISO));
-
-  const topSlots = candidates.slice(0, 3);
-
-  await logger.info('SlotFinder', `Found ${topSlots.length} optimal slots out of ${candidates.length} candidates`);
-  return topSlots;
-}
-
-/**
- * Format slot time cleanly for email string
- */
-function formatSlotTime(start, end, timeZone) {
-  const optionsDate = { weekday: 'short', month: 'short', day: 'numeric', timeZone: timeZone || 'Asia/Kolkata' };
-  const optionsTime = { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: timeZone || 'Asia/Kolkata' };
-
-  const dateStr = start.toLocaleDateString('en-IN', optionsDate);
-  const startTimeStr = start.toLocaleTimeString('en-IN', optionsTime);
-  const endTimeStr = end.toLocaleTimeString('en-IN', optionsTime);
-
-  const tzLabel = (timeZone === 'Asia/Kolkata' || !timeZone) ? 'IST' : timeZone;
-  return `${dateStr} from ${startTimeStr} to ${endTimeStr} (${tzLabel})`;
+  return candidates.slice(0, 3);
 }
 
 module.exports = {
-  findAvailableSlots,
-  formatSlotTime
+  DEFAULT_RULES,
+  getEffectiveUserRules,
+  isSlotWithinRules,
+  findAvailableSlots
 };

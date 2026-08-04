@@ -1,47 +1,69 @@
 const { analyze90DayHistory } = require('./calendarService');
-const { generateProposedRules } = require('./ruleEngine');
-const { saveUserRules, saveToneProfile } = require('./memory');
+const { saveUserRules, saveUserTone } = require('./userManager');
 const { setupGmailWatch } = require('./gmailService');
 const logger = require('./logger');
 
-/**
- * Execute initial onboarding scan and generate recommended rules
- */
+const INDIAN_HOLIDAYS_2026 = [
+  '2026-01-26',
+  '2026-03-20',
+  '2026-04-14',
+  '2026-08-15',
+  '2026-10-02',
+  '2026-10-21',
+  '2026-12-25'
+];
+
 async function initializeUserSetup(userEmail) {
   await logger.info('SetupService', `Starting setup analysis for user: ${userEmail}`);
 
-  // 1. Run 90-day calendar analysis
-  const calendarAnalysis = await analyze90DayHistory();
+  // 1. Run historical calendar analysis
+  const calendarAnalysis = await analyze90DayHistory(userEmail);
 
-  // 2. Generate proposed rules
-  const proposedRules = generateProposedRules(calendarAnalysis, 'Asia/Kolkata');
+  // 2. Draft recommended rules
+  const proposedRules = {
+    workingHours: {
+      start: calendarAnalysis?.workingHours?.start || '09:30',
+      end: calendarAnalysis?.workingHours?.end || '18:30',
+      timezone: 'Asia/Kolkata'
+    },
+    buffers: {
+      beforeMinutes: calendarAnalysis?.suggestedBuffers?.beforeMinutes || 15,
+      afterMinutes: calendarAnalysis?.suggestedBuffers?.afterMinutes || 15
+    },
+    noMeetingDays: calendarAnalysis?.noMeetingDays || ['Saturday', 'Sunday'],
+    holidays: INDIAN_HOLIDAYS_2026,
+    maxMeetingsPerDay: calendarAnalysis?.suggestedMaxMeetingsPerDay || 6,
+    preferredDuration: calendarAnalysis?.preferredDuration || 30,
+    preferredTimes: calendarAnalysis?.preferredHours || [10, 11, 14, 15, 16],
+    confirmed: false
+  };
 
-  // 3. Save initial rules as draft (unconfirmed)
-  await saveUserRules(proposedRules);
+  await saveUserRules(userEmail, proposedRules);
 
-  // 4. Default proposed tone
+  // 3. Draft default tone profile
   const defaultTone = {
     greeting: 'Hi',
     signOff: 'Best',
     formality: 5,
     samplePhrase: 'Thanks for reaching out! Here are a few times that work for me:'
   };
-  await saveToneProfile(defaultTone);
+  await saveUserTone(userEmail, defaultTone);
 
-  // 5. Attempt watch setup if topic provided
+  // 4. Register Gmail push notifications watch if configured
   const topicName = process.env.PUBSUB_TOPIC || process.env.GMAIL_PUBSUB_TOPIC;
   if (topicName) {
     try {
-      await setupGmailWatch(topicName);
+      await setupGmailWatch(userEmail, topicName);
     } catch (err) {
-      await logger.warn('SetupService', 'Could not enable Pub/Sub watch during setup', err.message);
+      await logger.warn('SetupService', `Watch setup warning for ${userEmail}: ${err.message}`);
     }
   }
 
-  await logger.info('SetupService', 'User setup initialized successfully');
+  await logger.info('SetupService', `Completed setup initialization for ${userEmail}`);
 
   return {
     success: true,
+    userEmail,
     rules: proposedRules,
     tone: defaultTone,
     analysis: calendarAnalysis

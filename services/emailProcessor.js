@@ -1,253 +1,211 @@
 const { fetchEmailContent, sendReply } = require('./gmailService');
-const { classifyEmail } = require('./classifier');
+const { getUserThread, saveUserThread, getUserRules, getUserTone, getUserState } = require('./userManager');
+const { classifyEmail, generateProposalEmail, analyzeReply, generateConfirmation } = require('./aiEngine');
 const { findAvailableSlots } = require('./slotFinder');
-const { generateResponse } = require('./responseGenerator');
-const { loadThreadState, getSchedulerState } = require('./memory');
-const { transitionThread } = require('./stateMachine');
-const { checkSlotAvailable, createCalendarEvent } = require('./calendarService');
-const { isAutoResponder, isDuplicateEmail, detectInfiniteLoop, isEmergencyPaused, flagThreadForHuman } = require('./safety');
+const { createCalendarEvent, checkSlotAvailable } = require('./calendarService');
+const { transitionThread, STATES } = require('./stateMachine');
+const { recordEmailHandled, recordMeetingBooked, recordThreadFlagged, recordActivity } = require('./statsTracker');
 const logger = require('./logger');
 
-/**
- * Core processing pipeline orchestrator
- */
-async function processEmail(messageId) {
-  console.log('=========================================');
-  console.log('📨 NEW EMAIL RECEIVED');
-  console.log('Message ID:', messageId);
-  console.log('Timestamp:', new Date().toISOString());
+async function processEmail(userEmail, messageId) {
+  await logger.info('EmailProcessor', `Processing email message ${messageId} for user ${userEmail}`);
 
-  try {
-    // Step 1: Fetch email
-    console.log('Step 1: Fetching email...');
-    const email = await fetchEmailContent(messageId);
-    const { threadId, senderEmail, subject, body, isAutoReply, senderTimezone, messageIdHeader, from } = email;
-    console.log('From:', from);
-    console.log('Subject:', subject);
-    console.log('Thread ID:', threadId);
-
-    // Step 2: Check if from self
-    console.log('Step 2: Checking if from self...');
-    const ownerEmail = (process.env.USER_EMAIL || '').toLowerCase();
-    if (ownerEmail && senderEmail === ownerEmail) {
-      console.log('❌ Email is from self - skipping');
-      console.log('=========================================');
-      return { status: 'SELF_EMAIL_SKIPPED' };
-    }
-
-    // Step 3: Check if already processed / duplicate
-    console.log('Step 3: Checking duplicates...');
-    let thread = await loadThreadState(threadId);
-    const threadHistory = thread?.history || [];
-    if (isDuplicateEmail(messageId, body, threadHistory)) {
-      console.log('❌ Already processed - skipping');
-      console.log('=========================================');
-      return { status: 'DUPLICATE_SKIPPED' };
-    }
-
-    // Step 4: Check auto-responder
-    console.log('Step 4: Checking auto-responder...');
-    if (isAutoReply || isAutoResponder([], subject, body)) {
-      console.log('❌ Auto-responder detected - stopping');
-      await flagThreadForHuman(threadId, 'Auto-responder detected', { senderEmail });
-      console.log('=========================================');
-      return { status: 'AUTO_RESPONDER_STOPPED' };
-    }
-
-    // Check emergency pause & infinite loop
-    if (await isEmergencyPaused(subject, body)) {
-      console.log('❌ Scheduler is emergency paused - skipping');
-      console.log('=========================================');
-      return { status: 'PAUSED' };
-    }
-
-    if (detectInfiniteLoop(threadHistory)) {
-      console.log('❌ Infinite loop safeguard triggered (>5 turns)');
-      await flagThreadForHuman(threadId, 'Infinite loop safeguard (>5 turns)', { senderEmail });
-      console.log('=========================================');
-      return { status: 'INFINITE_LOOP_FLAGGED' };
-    }
-
-    if (thread?.state === 'FLAGGED') {
-      console.log('❌ Thread is already FLAGGED - skipping auto-reply');
-      console.log('=========================================');
-      return { status: 'THREAD_ALREADY_FLAGGED' };
-    }
-
-    // Step 5: Classify intent
-    console.log('Step 5: Classifying intent...');
-    const classification = await classifyEmail({
-      subject,
-      body,
-      senderEmail,
-      history: threadHistory
-    });
-    console.log('Classification:', classification);
-
-    if (classification.classification === 'NOT_SCHEDULING') {
-      console.log('❌ Intent is NOT_SCHEDULING - ignoring');
-      console.log('=========================================');
-      return { status: 'NOT_SCHEDULING_IGNORED' };
-    }
-
-    if (classification.classification === 'UNCERTAIN') {
-      console.log('⚠️ Intent is UNCERTAIN - flagging for human review');
-      await flagThreadForHuman(threadId, `Uncertain intent: ${classification.reasoning}`, { senderEmail });
-      console.log('=========================================');
-      return { status: 'UNCERTAIN_FLAGGED' };
-    }
-
-    // Step 6: Processing SCHEDULING intent
-    console.log('Step 6: Processing scheduling request...');
-    const durationMinutes = classification.durationMinutes || 30;
-
-    // Check if recipient is selecting a proposed slot from previous offer
-    if (thread?.proposedSlots && thread.proposedSlots.length > 0) {
-      let chosenSlot = null;
-
-      if (classification.userChoice) {
-        if (typeof classification.userChoice === 'number' && thread.proposedSlots[classification.userChoice - 1]) {
-          chosenSlot = thread.proposedSlots[classification.userChoice - 1];
-        } else {
-          chosenSlot = thread.proposedSlots.find(s =>
-            (classification.userChoice && typeof classification.userChoice === 'string' && s.formattedSenderTz.toLowerCase().includes(classification.userChoice.toLowerCase()))
-          );
-        }
-      }
-
-      if (!chosenSlot && (body.toLowerCase().includes('option 1') || body.toLowerCase().includes('first option'))) {
-        chosenSlot = thread.proposedSlots[0];
-      } else if (!chosenSlot && body.toLowerCase().includes('option 2')) {
-        chosenSlot = thread.proposedSlots[1];
-      } else if (!chosenSlot && body.toLowerCase().includes('option 3')) {
-        chosenSlot = thread.proposedSlots[2];
-      } else if (!chosenSlot && (body.toLowerCase().includes('works') || body.toLowerCase().includes('sounds good') || body.toLowerCase().includes('perfect'))) {
-        chosenSlot = thread.proposedSlots[0];
-      }
-
-      if (chosenSlot) {
-        console.log('User chosen slot identified:', chosenSlot);
-        const isFree = await checkSlotAvailable(chosenSlot.startISO, chosenSlot.endISO);
-
-        if (isFree) {
-          console.log('Booking confirmed calendar event...');
-          const eventDetails = await createCalendarEvent({
-            summary: subject.replace(/^Re:\s*/i, ''),
-            description: `Scheduled autonomously via Autonomous Scheduler.\n\nOriginal Request: ${body}`,
-            startISO: chosenSlot.startISO,
-            endISO: chosenSlot.endISO,
-            attendees: [senderEmail],
-            timeZone: senderTimezone || 'UTC'
-          });
-
-          const replyText = await generateResponse({
-            type: 'CONFIRMATION',
-            bookedDetails: eventDetails,
-            originalSubject: subject,
-            senderName: senderEmail.split('@')[0],
-            originalEmail: body
-          });
-
-          await sendReply({
-            threadId,
-            to: senderEmail,
-            subject,
-            body: replyText,
-            inReplyToMessageId: messageIdHeader
-          });
-
-          await transitionThread(threadId, 'BOOKED', {
-            senderEmail,
-            bookedEvent: eventDetails,
-            finalSlot: chosenSlot
-          });
-
-          console.log('✅ Email processed successfully: BOOKED');
-          console.log('=========================================');
-          return { status: 'BOOKED_SUCCESS', event: eventDetails };
-        } else {
-          console.log('Chosen slot unavailable; re-proposing new slots...');
-          const newSlots = await findAvailableSlots({ durationMinutes, senderTimezone });
-          const apologyReply = await generateResponse({
-            type: 'APOLOGY_SLOT_TAKEN',
-            proposedSlots: newSlots,
-            originalSubject: subject,
-            senderName: senderEmail.split('@')[0],
-            originalEmail: body
-          });
-
-          await sendReply({
-            threadId,
-            to: senderEmail,
-            subject,
-            body: apologyReply,
-            inReplyToMessageId: messageIdHeader
-          });
-
-          await transitionThread(threadId, 'PROPOSED', {
-            senderEmail,
-            proposedSlots: newSlots
-          });
-
-          console.log('✅ Email processed successfully: REPROPOSED');
-          console.log('=========================================');
-          return { status: 'SLOT_TAKEN_REPROPOSED' };
-        }
-      }
-    }
-
-    // Initial proposal or negotiation
-    console.log('Finding open calendar slots...');
-    const availableSlots = await findAvailableSlots({
-      durationMinutes,
-      senderTimezone: senderTimezone || classification.senderTimezone,
-      constraints: classification.constraints
-    });
-
-    if (!availableSlots || availableSlots.length === 0) {
-      console.log('❌ No open slots found - flagging thread');
-      await flagThreadForHuman(threadId, 'No open calendar slots found meeting criteria', { senderEmail });
-      console.log('=========================================');
-      return { status: 'NO_SLOTS_FLAGGED' };
-    }
-
-    const responseType = thread?.state === 'PROPOSED' ? 'NEGOTIATION' : 'PROPOSAL';
-    console.log(`Generating ${responseType} response text...`);
-    const replyText = await generateResponse({
-      type: responseType,
-      proposedSlots: availableSlots,
-      originalSubject: subject,
-      senderName: senderEmail.split('@')[0],
-      originalEmail: body
-    });
-
-    console.log('Sending reply via Gmail API...');
-    await sendReply({
-      threadId,
-      to: senderEmail,
-      subject,
-      body: replyText,
-      inReplyToMessageId: messageIdHeader
-    });
-
-    const targetState = responseType === 'NEGOTIATION' ? 'NEGOTIATING' : 'PROPOSED';
-    await transitionThread(threadId, targetState, {
-      senderEmail,
-      senderTimezone,
-      proposedSlots: availableSlots,
-      lastMessageId: messageId
-    });
-
-    console.log(`✅ Email processed successfully: ${targetState}`);
-    console.log('=========================================');
-    return { status: `${targetState}_SENT`, slots: availableSlots };
-
-  } catch (err) {
-    console.error('❌ Unhandled error processing email:', err);
-    await logger.error('EmailProcessor', `Unhandled error processing message ${messageId}`, err.stack);
-    console.log('=========================================');
-    return { status: 'ERROR', error: err.message };
+  // 1. Check if user is paused
+  const userState = await getUserState(userEmail);
+  if (userState.paused) {
+    await logger.info('EmailProcessor', `User ${userEmail} is PAUSED. Skipping email ${messageId}`);
+    return { status: 'SKIPPED_PAUSED' };
   }
+
+  // 2. Fetch email details
+  const email = await fetchEmailContent(userEmail, messageId);
+
+  // 3. Skip if sent by user self
+  if (email.senderEmail === userEmail.toLowerCase()) {
+    await logger.info('EmailProcessor', `Skipping self-sent email ${messageId} for ${userEmail}`);
+    return { status: 'SKIPPED_SELF' };
+  }
+
+  // 4. Skip auto-responders
+  if (email.isAutoReply) {
+    await logger.info('EmailProcessor', `Skipping auto-reply email ${messageId} for ${userEmail}`);
+    return { status: 'SKIPPED_AUTOREPLY' };
+  }
+
+  // 5. Load thread state
+  let thread = (await getUserThread(userEmail, email.threadId)) || {
+    threadId: email.threadId,
+    userEmail,
+    senderEmail: email.senderEmail,
+    subject: email.subject,
+    state: STATES.UNCLASSIFIED,
+    processedMessages: [],
+    history: []
+  };
+
+  // Skip duplicate processing
+  if ((thread.processedMessages || []).includes(messageId)) {
+    return { status: 'ALREADY_PROCESSED' };
+  }
+  thread.processedMessages = [...(thread.processedMessages || []), messageId];
+
+  // Record initial stats
+  await recordEmailHandled(userEmail, {
+    icon: 'Mail',
+    description: `Received email from ${email.from}: "${email.subject}"`,
+    sender: email.from,
+    subject: email.subject,
+    threadId: email.threadId
+  });
+
+  const rules = (await getUserRules(userEmail)) || {};
+  const tone = (await getUserTone(userEmail)) || {};
+
+  // 6. If thread is brand new or UNCLASSIFIED, run classifier
+  if (!thread.state || thread.state === STATES.UNCLASSIFIED) {
+    const classification = await classifyEmail(email.body, email.subject, thread.history || []);
+
+    if (classification.intent === 'NOT_SCHEDULING') {
+      await saveUserThread(userEmail, email.threadId, { ...thread, state: STATES.COMPLETED });
+      return { status: 'NOT_SCHEDULING' };
+    }
+
+    if (classification.intent === 'UNCERTAIN') {
+      await transitionThread(userEmail, email.threadId, STATES.FLAGGED, {
+        reason: 'Low AI classification confidence'
+      });
+      await recordThreadFlagged(userEmail, {
+        icon: 'AlertTriangle',
+        description: `Flagged thread from ${email.from} (Uncertain intent)`,
+        sender: email.from,
+        threadId: email.threadId
+      });
+      return { status: 'FLAGGED' };
+    }
+
+    // Scheduling intent detected -> Find available slots
+    const slots = await findAvailableSlots({
+      userEmail,
+      durationMinutes: classification.extracted?.duration || rules.preferredDuration || 30
+    });
+
+    if (!slots || slots.length === 0) {
+      await transitionThread(userEmail, email.threadId, STATES.FLAGGED, {
+        reason: 'No open slots found in user calendar'
+      });
+      return { status: 'FLAGGED_NO_SLOTS' };
+    }
+
+    // Generate proposal email
+    const proposalText = await generateProposalEmail(userEmail, email.from.split('<')[0].trim(), slots, classification.extracted, tone);
+
+    // Send reply
+    await sendReply({
+      userEmail,
+      threadId: email.threadId,
+      to: email.from,
+      subject: email.subject,
+      body: proposalText,
+      inReplyToMessageId: email.messageIdHeader || email.id
+    });
+
+    // Update thread state to PROPOSED
+    thread.proposedSlots = slots;
+    thread.classification = classification;
+    await transitionThread(userEmail, email.threadId, STATES.PROPOSED, {
+      action: 'Sent meeting slot proposals',
+      slots
+    });
+
+    await recordActivity(userEmail, {
+      icon: 'Send',
+      description: `Sent meeting slot options to ${email.from}`,
+      sender: email.from,
+      threadId: email.threadId
+    });
+
+    return { status: 'PROPOSED' };
+  }
+
+  // 7. If thread is in PROPOSED or NEGOTIATING, evaluate reply
+  if ([STATES.PROPOSED, STATES.NEGOTIATING].includes(thread.state)) {
+    const analysis = await analyzeReply(email.body, thread);
+
+    if (analysis.type === 'ACCEPTED' && analysis.chosenSlotIndex !== null) {
+      const chosenSlot = thread.proposedSlots[analysis.chosenSlotIndex] || thread.proposedSlots[0];
+
+      // Double-check slot availability
+      const isStillAvailable = await checkSlotAvailable(userEmail, chosenSlot.startISO, chosenSlot.endISO);
+      if (!isStillAvailable) {
+        // Re-find slots
+        const newSlots = await findAvailableSlots({ userEmail, durationMinutes: 30 });
+        const apologyText = `Hi ${email.from.split('<')[0]},\n\nThat slot was just booked. Here are updated options:\n\n${newSlots.map(s => s.formattedText).join('\n')}\n\nBest,`;
+        await sendReply({
+          userEmail,
+          threadId: email.threadId,
+          to: email.from,
+          subject: email.subject,
+          body: apologyText,
+          inReplyToMessageId: email.messageIdHeader || email.id
+        });
+        thread.proposedSlots = newSlots;
+        await transitionThread(userEmail, email.threadId, STATES.NEGOTIATING, { action: 'Re-proposed slots due to conflict' });
+        return { status: 'RE_PROPOSED' };
+      }
+
+      // Create Calendar Event
+      const eventDetails = await createCalendarEvent({
+        userEmail,
+        summary: `Meeting: ${thread.subject || 'Discussion'}`,
+        description: `Autonomous meeting scheduled between ${userEmail} and ${email.senderEmail}`,
+        startISO: chosenSlot.startISO,
+        endISO: chosenSlot.endISO,
+        attendees: [email.senderEmail]
+      });
+
+      // Send confirmation email
+      const confirmationText = await generateConfirmation(email.from.split('<')[0].trim(), eventDetails, tone);
+      await sendReply({
+        userEmail,
+        threadId: email.threadId,
+        to: email.from,
+        subject: email.subject,
+        body: confirmationText,
+        inReplyToMessageId: email.messageIdHeader || email.id
+      });
+
+      thread.bookedDetails = eventDetails;
+      await transitionThread(userEmail, email.threadId, STATES.BOOKED, {
+        action: 'Booked meeting and sent invite',
+        eventDetails
+      });
+
+      await recordMeetingBooked(userEmail, {
+        icon: 'CalendarCheck',
+        description: `Booked meeting with ${email.from} for ${chosenSlot.formattedText}`,
+        sender: email.from,
+        threadId: email.threadId
+      });
+
+      return { status: 'BOOKED' };
+    }
+
+    // UNCLEAR reply -> Flag thread for human review
+    await transitionThread(userEmail, email.threadId, STATES.FLAGGED, {
+      reason: 'Unclear recipient reply during negotiation'
+    });
+
+    await recordThreadFlagged(userEmail, {
+      icon: 'AlertTriangle',
+      description: `Flagged thread from ${email.from} (Unclear reply)`,
+      sender: email.from,
+      threadId: email.threadId
+    });
+
+    return { status: 'FLAGGED' };
+  }
+
+  return { status: 'NO_ACTION' };
 }
 
 module.exports = {

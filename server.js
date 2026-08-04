@@ -4,18 +4,29 @@ const cors = require('cors');
 const fs = require('fs-extra');
 const path = require('path');
 const cron = require('node-cron');
-const { initializeStorage, listAllThreads, loadThreadState, getSchedulerState, setSchedulerState, saveUserRules, loadUserRules, saveToneProfile, loadToneProfile, loadRefreshToken, LOGS_DIR } = require('./services/memory');
-const { handleOAuthCode, getAuthUrl, setupGmailWatch, getGmailClient, verifyPushNotifications } = require('./services/gmailService');
-const { initializeUserSetup } = require('./services/setupService');
+const {
+  initStorage,
+  getUserTokens,
+  getUserRules,
+  getUserTone,
+  getUserState,
+  setUserState,
+  saveUserRules,
+  saveUserTone,
+  listUserThreads,
+  getUserThread,
+  LOGS_DIR
+} = require('./services/userManager');
+const { generateOAuthUrl, handleOAuthCallback } = require('./services/oauthService');
 const { processEmail } = require('./services/emailProcessor');
-const { transitionThread, cleanupOldThreads } = require('./services/stateMachine');
+const { transitionThread } = require('./services/stateMachine');
+const { getUserStats, recordActivity } = require('./services/statsTracker');
+const { startGlobalScheduler } = require('./services/globalScheduler');
 const { startKeepAlive } = require('./services/keepAlive');
 const { rotateLogs } = require('./services/logger');
 const logger = require('./services/logger');
 
 const app = express();
-
-// Parse query params reliably
 app.set('query parser', 'simple');
 
 const rawPort = process.env.PORT;
@@ -38,134 +49,50 @@ app.use((req, res, next) => {
   next();
 });
 
-// Initialize persistent directories on startup
-initializeStorage().then(() => {
-  logger.info('Server', 'Persistent storage initialized');
+// Initialize storage and background scheduler
+initStorage().then(() => {
+  logger.info('Server', 'Multi-user storage initialized');
+  startGlobalScheduler();
 }).catch(err => {
   logger.error('Server', 'Failed to initialize storage', err);
 });
 
-// Start Keep-Alive service
+// Keep-Alive self ping
 startKeepAlive(PORT);
 
 // Log rotation every 24h
 setInterval(() => {
   rotateLogs();
-  cleanupOldThreads();
 }, 24 * 60 * 60 * 1000);
 
-// Polling fallback every 2 minutes
-cron.schedule('*/2 * * * *', async () => {
-  try {
-    const refreshToken = await loadRefreshToken();
-    if (!refreshToken) return;
-
-    const rules = await loadUserRules();
-    if (!rules || !rules.confirmed) return;
-
-    const schedulerState = await getSchedulerState();
-    if (schedulerState.paused) return;
-
-    const gmail = await getGmailClient();
-    const messages = await gmail.users.messages.list({
-      userId: 'me',
-      q: 'is:unread -from:me',
-      maxResults: 5
-    });
-
-    if (messages.data.messages) {
-      for (const msg of messages.data.messages) {
-        await processEmail(msg.id);
-      }
-    }
-  } catch (err) {
-    // Routine polling silent check
-  }
-});
-
 /**
- * Root Route (GET /) - Shows server status
+ * Health Check Endpoint
  */
-app.get('/', (req, res) => {
-  res.json({
-    status: 'running',
-    app: 'Meeting Scheduler AI',
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'healthy',
+    app: 'Multi-User Meeting Scheduler SaaS AI',
+    uptime: process.uptime(),
     timezone: TIMEZONE,
-    serverTime: new Date().toLocaleString('en-IN', { timeZone: TIMEZONE }),
-    endpoints: [
-      'GET /health',
-      'POST /webhook/gmail',
-      'GET /oauth/callback',
-      'GET /api/dashboard',
-      'GET /api/threads',
-      'POST /api/rules/confirm',
-      'POST /api/pause',
-      'POST /api/resume'
-    ]
+    serverTime: new Date().toLocaleString('en-IN', { timeZone: TIMEZONE })
   });
-});
-
-/**
- * Health Check Endpoint (CRITICAL for Render)
- */
-app.get('/health', async (req, res) => {
-  try {
-    const gmail = await getGmailClient();
-    const profile = await gmail.users.getProfile({ userId: 'me' });
-
-    res.status(200).json({
-      status: 'healthy',
-      gmail: 'connected',
-      email: profile.data.emailAddress,
-      uptime: process.uptime(),
-      timezone: TIMEZONE,
-      serverTime: new Date().toLocaleString('en-IN', { timeZone: TIMEZONE }),
-      memory: process.memoryUsage()
-    });
-  } catch (error) {
-    res.status(200).json({
-      status: 'healthy',
-      gmail: 'disconnected',
-      error: error.message,
-      uptime: process.uptime(),
-      timezone: TIMEZONE,
-      serverTime: new Date().toLocaleString('en-IN', { timeZone: TIMEZONE })
-    });
-  }
-});
-
-/**
- * Debug Logs Endpoint
- */
-app.get('/debug/logs', (req, res) => {
-  try {
-    const logDir = LOGS_DIR || path.join(__dirname, 'data/logs');
-
-    if (!fs.existsSync(logDir)) {
-      return res.json({ logs: 'No logs directory found' });
-    }
-
-    const today = new Date().toISOString().split('T')[0];
-    const logFile = path.join(logDir, `${today}.log`);
-
-    if (fs.existsSync(logFile)) {
-      const logs = fs.readFileSync(logFile, 'utf8');
-      const recentLogs = logs.split('\n').slice(-50).join('\n');
-      return res.json({ logs: recentLogs });
-    }
-
-    res.json({ logs: 'No logs for today' });
-  } catch (error) {
-    res.json({ error: error.message });
-  }
 });
 
 /**
  * Get OAuth Authorization URL
  */
+app.get('/api/auth/url', (req, res) => {
+  try {
+    const url = generateOAuthUrl();
+    res.json({ url });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/auth/url', (req, res) => {
   try {
-    const url = getAuthUrl();
+    const url = generateOAuthUrl();
     res.json({ url });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -173,7 +100,7 @@ app.get('/auth/url', (req, res) => {
 });
 
 /**
- * OAuth Callback Route (FIXED: Supports JSON response for fetch & browser redirect)
+ * OAuth Callback Route
  */
 app.get('/oauth/callback', async (req, res) => {
   console.log('🔑 OAuth callback received');
@@ -201,30 +128,18 @@ app.get('/oauth/callback', async (req, res) => {
   }
 
   try {
-    const tokens = await handleOAuthCode(code);
-    const userEmail = process.env.USER_EMAIL || 'user@example.com';
-    await initializeUserSetup(userEmail);
-
-    const topicName = process.env.PUBSUB_TOPIC || process.env.GMAIL_PUBSUB_TOPIC;
-    if (topicName) {
-      try {
-        await setupGmailWatch(topicName);
-      } catch (watchErr) {
-        console.warn('Pub/Sub watch warning:', watchErr.message);
-      }
-    }
-
-    console.log('✅ Authorization code received & tokens stored successfully');
+    const result = await handleOAuthCallback(code);
+    console.log(`✅ OAuth successful for user: ${result.email}`);
 
     if (wantsJson) {
       return res.status(200).json({
         success: true,
-        message: 'Gmail connected and setup completed successfully',
-        tokensReceived: true
+        email: result.email,
+        message: 'Gmail connected and user account initialized successfully'
       });
     }
 
-    res.redirect(`${frontendUrl}/setup?status=connected`);
+    res.redirect(`${frontendUrl}/setup?status=connected&email=${encodeURIComponent(result.email)}`);
   } catch (err) {
     await logger.error('Server', 'OAuth Callback Failed', err.message);
     if (wantsJson) {
@@ -235,119 +150,42 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 /**
- * Gmail Webhook Notification Endpoint (Pub/Sub)
+ * User Status Check API
  */
-app.post('/webhook/gmail', async (req, res) => {
-  console.log('📧 Webhook received:', new Date().toISOString());
-  console.log('Body:', JSON.stringify(req.body));
-
-  // IMPORTANT: Always respond 200 immediately
-  res.status(200).send('OK');
+app.get('/api/user/status', async (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ error: 'email query parameter required' });
 
   try {
-    const { message } = req.body;
+    const tokens = await getUserTokens(email);
+    const rules = await getUserRules(email);
+    const state = await getUserState(email);
 
-    if (!message) {
-      console.log('❌ No message in webhook body');
-      return;
-    }
-
-    if (message.data) {
-      const dataStr = Buffer.from(message.data, 'base64').toString('utf8');
-      console.log('📨 Notification data:', dataStr);
-      const data = JSON.parse(dataStr);
-
-      if (data.messageId) {
-        await processEmail(data.messageId);
-      }
-
-      const historyId = data.historyId;
-      if (historyId) {
-        try {
-          const gmail = await getGmailClient();
-          const history = await gmail.users.history.list({
-            userId: 'me',
-            startHistoryId: historyId,
-            historyTypes: ['messageAdded']
-          });
-
-          if (history.data.history) {
-            for (const h of history.data.history) {
-              if (h.messagesAdded) {
-                for (const msg of h.messagesAdded) {
-                  if (msg.message && msg.message.id) {
-                    await processEmail(msg.message.id);
-                  }
-                }
-              }
-            }
-          }
-        } catch (histErr) {
-          console.error('Error fetching Gmail history:', histErr.message);
-        }
-      }
-    }
-  } catch (error) {
-    console.error('❌ Error processing webhook:', error.message);
-  }
-});
-
-/**
- * Manual Test Endpoint: process recent unread emails
- */
-app.get('/test-process-recent', async (req, res) => {
-  try {
-    const gmail = await getGmailClient();
-
-    const messages = await gmail.users.messages.list({
-      userId: 'me',
-      maxResults: 5,
-      q: 'is:unread -from:me'
+    res.json({
+      email,
+      authenticated: !!tokens,
+      rulesConfirmed: !!(rules && rules.confirmed),
+      paused: state.paused,
+      timezone: TIMEZONE
     });
-
-    const results = [];
-
-    if (messages.data.messages) {
-      for (const msg of messages.data.messages) {
-        console.log('Manually processing:', msg.id);
-        const procResult = await processEmail(msg.id);
-        results.push(`Processed: ${msg.id} - ${procResult?.status || 'DONE'}`);
-      }
-    } else {
-      results.push('No unread messages found');
-    }
-
-    res.json({ success: true, results });
-  } catch (error) {
-    console.error('Test failed:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * Direct Manual Message Processing Trigger API
- */
-app.post('/api/process-message', async (req, res) => {
-  const { messageId } = req.body;
-  if (!messageId) return res.status(400).json({ error: 'messageId required' });
-
-  try {
-    const result = await processEmail(messageId);
-    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 /**
- * Dashboard Overview Stats API
+ * User Dashboard Overview Stats API
  */
-app.get('/api/dashboard', async (req, res) => {
+app.get('/api/user/dashboard', async (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ error: 'email query parameter required' });
+
   try {
-    const refreshToken = await loadRefreshToken();
-    const rules = await loadUserRules();
-    const state = await getSchedulerState();
-    const threads = await listAllThreads();
+    const state = await getUserState(email);
+    const threads = await listUserThreads(email);
+    const stats = await getUserStats(email);
+    const tokens = await getUserTokens(email);
+    const rules = await getUserRules(email);
 
     const now = new Date();
     const todayStr = now.toISOString().split('T')[0];
@@ -356,59 +194,84 @@ app.get('/api/dashboard', async (req, res) => {
     const bookedToday = todayThreads.filter(t => t.state === 'BOOKED');
     const flagged = threads.filter(t => t.state === 'FLAGGED');
 
-    const recentActivity = threads.slice(0, 10).map(t => ({
-      id: t.threadId,
-      sender: t.senderEmail || 'Unknown',
-      state: t.state,
-      lastAction: t.history?.[t.history.length - 1]?.action || 'Updated',
-      timestamp: t.lastUpdated,
-      subject: t.subject || 'Meeting Request'
-    }));
-
     res.json({
       status: state.paused ? 'PAUSED' : 'ACTIVE',
-      authenticated: !!refreshToken,
+      authenticated: !!tokens,
       rulesConfirmed: !!(rules && rules.confirmed),
       stats: {
         emailsHandledToday: todayThreads.length,
         meetingsBookedToday: bookedToday.length,
-        activeThreads: threads.filter(t => t.state !== 'BOOKED').length,
+        activeThreads: threads.filter(t => t.state !== 'BOOKED' && t.state !== 'COMPLETED').length,
         needsAttention: flagged.length,
-        emailsHandled: todayThreads.length,
-        meetingsBooked: bookedToday.length
+        totalEmailsHandled: stats.totalEmailsHandled || 0,
+        totalMeetingsBooked: stats.totalMeetingsBooked || 0
       },
       flaggedThreads: flagged,
-      recentActivity,
+      recentActivity: stats.recentActivity || [],
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    console.error('❌ Dashboard error:', error.message);
-    res.status(500).json({ error: 'Failed to load dashboard' });
+    console.error(`❌ Dashboard error for ${email}:`, error.message);
+    res.status(500).json({ error: 'Failed to load user dashboard' });
+  }
+});
+
+// Fallback GET /api/dashboard
+app.get('/api/dashboard', async (req, res) => {
+  const email = req.query.email || 'user@example.com';
+  req.query.email = email;
+  return app._router.handle(req, res);
+});
+
+/**
+ * User Stats API
+ */
+app.get('/api/user/stats', async (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ error: 'email query parameter required' });
+
+  try {
+    const stats = await getUserStats(email);
+    res.json({ stats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
 /**
- * List Threads API
+ * User Threads API
  */
+app.get('/api/user/threads', async (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ error: 'email query parameter required' });
+
+  try {
+    const threads = await listUserThreads(email);
+    res.json({ threads, total: threads.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/threads', async (req, res) => {
+  const email = req.query.email || 'user@example.com';
   try {
-    const threads = await listAllThreads();
-    res.json({
-      threads,
-      total: threads.length
-    });
-  } catch (error) {
-    console.error('❌ Threads error:', error.message);
-    res.status(500).json({ error: 'Failed to load threads' });
+    const threads = await listUserThreads(email);
+    res.json({ threads, total: threads.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
 /**
- * Get Specific Thread Details API
+ * Specific Thread Detail API
  */
-app.get('/api/threads/:id', async (req, res) => {
+app.get('/api/user/threads/:id', async (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ error: 'email query parameter required' });
+
   try {
-    const thread = await loadThreadState(req.params.id);
+    const thread = await getUserThread(email, req.params.id);
     if (!thread) return res.status(404).json({ error: 'Thread not found' });
     res.json({ thread });
   } catch (err) {
@@ -417,53 +280,90 @@ app.get('/api/threads/:id', async (req, res) => {
 });
 
 /**
- * Rules Confirmation & Management API
+ * User Rules Management API
  */
-app.get('/api/rules', async (req, res) => {
+app.get('/api/user/rules', async (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ error: 'email query parameter required' });
+
   try {
-    const rules = (await loadUserRules()) || {};
+    const rules = (await getUserRules(email)) || {};
     res.json({ rules });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/rules/confirm', async (req, res) => {
+app.get('/api/rules', async (req, res) => {
+  const email = req.query.email || 'user@example.com';
   try {
-    const rulesInput = req.body.rules || req.body;
-    if (!rulesInput) return res.status(400).json({ error: 'rules required' });
+    const rules = (await getUserRules(email)) || {};
+    res.json({ rules });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
+app.post('/api/user/rules/confirm', async (req, res) => {
+  const email = req.body.email || req.query.email;
+  const rulesInput = req.body.rules || req.body;
+  if (!email) return res.status(400).json({ error: 'email required' });
+
+  try {
     const confirmedRules = {
       ...rulesInput,
       confirmed: true,
       updatedAt: new Date().toISOString()
     };
 
-    const saved = await saveUserRules(confirmedRules);
-    await logger.info('Server', 'Confirmed updated user rules', saved);
+    const saved = await saveUserRules(email, confirmedRules);
+    await logger.info('Server', `Confirmed updated user rules for ${email}`, saved);
     res.json({ success: true, rules: saved });
   } catch (err) {
-    console.error('❌ Rules confirmation error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/rules/confirm', async (req, res) => {
+  const email = req.body.email || req.query.email || 'user@example.com';
+  req.body.email = email;
+  const rulesInput = req.body.rules || req.body;
+
+  try {
+    const confirmedRules = {
+      ...rulesInput,
+      confirmed: true,
+      updatedAt: new Date().toISOString()
+    };
+
+    const saved = await saveUserRules(email, confirmedRules);
+    res.json({ success: true, rules: saved });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 /**
- * Tone Settings API
+ * User Tone Settings API
  */
-app.get('/api/tone', async (req, res) => {
+app.get('/api/user/tone', async (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ error: 'email query parameter required' });
+
   try {
-    const tone = (await loadToneProfile()) || {};
+    const tone = (await getUserTone(email)) || {};
     res.json({ tone });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/tone', async (req, res) => {
+app.post('/api/user/tone/update', async (req, res) => {
+  const email = req.body.email || req.query.email;
+  if (!email) return res.status(400).json({ error: 'email required' });
+
   try {
-    const tone = req.body;
-    const saved = await saveToneProfile(tone);
+    const saved = await saveUserTone(email, req.body.tone || req.body);
     res.json({ success: true, tone: saved });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -473,38 +373,64 @@ app.post('/api/tone', async (req, res) => {
 /**
  * Pause / Resume Endpoints
  */
-app.post('/api/pause', async (req, res) => {
+app.post('/api/user/pause', async (req, res) => {
+  const email = req.body.email || req.query.email;
+  if (!email) return res.status(400).json({ error: 'email required' });
+
   try {
-    const updated = await setSchedulerState(true);
-    await logger.warn('Server', 'Scheduler system PAUSED by user');
+    const updated = await setUserState(email, true);
+    await recordActivity(email, { icon: 'Pause', description: 'System paused by user' });
     res.json({ success: true, state: updated });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.post('/api/user/resume', async (req, res) => {
+  const email = req.body.email || req.query.email;
+  if (!email) return res.status(400).json({ error: 'email required' });
+
+  try {
+    const updated = await setUserState(email, false);
+    await recordActivity(email, { icon: 'Play', description: 'System resumed by user' });
+    res.json({ success: true, state: updated });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/pause', async (req, res) => {
+  const email = req.body.email || req.query.email || 'user@example.com';
+  const updated = await setUserState(email, true);
+  res.json({ success: true, state: updated });
 });
 
 app.post('/api/resume', async (req, res) => {
-  try {
-    const updated = await setSchedulerState(false);
-    await logger.info('Server', 'Scheduler system RESUMED by user');
-    res.json({ success: true, state: updated });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const email = req.body.email || req.query.email || 'user@example.com';
+  const updated = await setUserState(email, false);
+  res.json({ success: true, state: updated });
 });
 
 /**
- * Manual Thread Takeover / Resolve API
+ * Thread Takeover / Resolve API
  */
-app.post('/api/takeover/:threadId', async (req, res) => {
+app.post('/api/user/takeover/:threadId', async (req, res) => {
+  const email = req.body.email || req.query.email;
   const { action, note } = req.body;
+  if (!email) return res.status(400).json({ error: 'email required' });
+
   try {
-    const threadId = req.params.id || req.params.threadId;
+    const threadId = req.params.threadId;
     const targetState = action === 'RESOLVE' ? 'BOOKED' : 'UNRESOLVED';
 
-    const updated = await transitionThread(threadId, targetState, {
-      note: note || 'Manual human takeover via dashboard',
-      needsAttention: false
+    const updated = await transitionThread(email, threadId, targetState, {
+      note: note || 'Manual human takeover via dashboard'
+    });
+
+    await recordActivity(email, {
+      icon: 'Shield',
+      description: `Manual takeover on thread ${threadId}`,
+      threadId
     });
 
     res.json({ success: true, thread: updated });
@@ -513,13 +439,32 @@ app.post('/api/takeover/:threadId', async (req, res) => {
   }
 });
 
+/**
+ * Gmail Webhook Notification Endpoint (Pub/Sub)
+ */
+app.post('/webhook/gmail', async (req, res) => {
+  res.status(200).send('OK');
+
+  try {
+    const { message } = req.body;
+    if (!message || !message.data) return;
+
+    const dataStr = Buffer.from(message.data, 'base64').toString('utf8');
+    const data = JSON.parse(dataStr);
+    const emailAddress = data.emailAddress;
+
+    if (emailAddress && data.messageId) {
+      await processEmail(emailAddress.toLowerCase(), data.messageId);
+    }
+  } catch (error) {
+    console.error('❌ Webhook error:', error.message);
+  }
+});
+
 // Start Express Server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Meeting Scheduler Backend running on port', PORT);
+  console.log('🚀 Multi-User Meeting Scheduler SaaS Backend running on port', PORT);
   console.log('📍 Root endpoint: https://gravity-backend-rdvr.onrender.com/');
   console.log('📍 Health check: https://gravity-backend-rdvr.onrender.com/health');
-  console.log('📧 Webhook endpoint: https://gravity-backend-rdvr.onrender.com/webhook/gmail');
-  console.log('🔑 OAuth callback: https://gravity-backend-rdvr.onrender.com/oauth/callback');
-  console.log('✅ Server ready to receive requests');
-  logger.info('Server', `Autonomous Scheduler Backend listening on 0.0.0.0:${PORT}`);
+  logger.info('Server', `Autonomous Multi-User Backend listening on 0.0.0.0:${PORT}`);
 });

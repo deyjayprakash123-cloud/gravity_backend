@@ -1,104 +1,79 @@
-const { loadThreadState, saveThreadState, listAllThreads, deleteThread } = require('./memory');
+const { saveUserThread, getUserThread, listUserThreads } = require('./userManager');
 const logger = require('./logger');
 
-const VALID_STATES = {
+const STATES = {
   UNCLASSIFIED: 'UNCLASSIFIED',
   PROPOSED: 'PROPOSED',
   NEGOTIATING: 'NEGOTIATING',
   BOOKED: 'BOOKED',
+  COMPLETED: 'COMPLETED',
   UNRESOLVED: 'UNRESOLVED',
-  FLAGGED: 'FLAGGED'
+  FLAGGED: 'FLAGGED',
+  CANCELLED: 'CANCELLED'
 };
 
-const ALLOWED_TRANSITIONS = {
-  UNCLASSIFIED: ['PROPOSED', 'FLAGGED', 'UNRESOLVED'],
-  PROPOSED: ['NEGOTIATING', 'BOOKED', 'PROPOSED', 'FLAGGED', 'UNRESOLVED'],
-  NEGOTIATING: ['PROPOSED', 'BOOKED', 'FLAGGED', 'UNRESOLVED'],
-  FLAGGED: ['PROPOSED', 'BOOKED', 'UNRESOLVED'],
-  UNRESOLVED: ['PROPOSED', 'BOOKED', 'FLAGGED'],
-  BOOKED: [] // Terminal state
+const VALID_TRANSITIONS = {
+  [STATES.UNCLASSIFIED]: [STATES.PROPOSED, STATES.FLAGGED, STATES.UNRESOLVED],
+  [STATES.PROPOSED]: [STATES.NEGOTIATING, STATES.BOOKED, STATES.FLAGGED, STATES.UNRESOLVED, STATES.CANCELLED],
+  [STATES.NEGOTIATING]: [STATES.BOOKED, STATES.PROPOSED, STATES.FLAGGED, STATES.UNRESOLVED, STATES.CANCELLED],
+  [STATES.BOOKED]: [STATES.COMPLETED, STATES.CANCELLED, STATES.UNRESOLVED],
+  [STATES.COMPLETED]: [],
+  [STATES.UNRESOLVED]: [STATES.PROPOSED, STATES.BOOKED, STATES.COMPLETED],
+  [STATES.FLAGGED]: [STATES.PROPOSED, STATES.BOOKED, STATES.UNRESOLVED, STATES.COMPLETED],
+  [STATES.CANCELLED]: []
 };
 
-/**
- * Transition thread state with validation and persistence
- */
-async function transitionThread(threadId, newState, updatePayload = {}) {
-  if (!VALID_STATES[newState]) {
-    throw new Error(`Invalid target state: ${newState}`);
+async function transitionThread(userEmail, threadId, targetState, metadata = {}) {
+  const current = (await getUserThread(userEmail, threadId)) || {
+    threadId,
+    state: STATES.UNCLASSIFIED,
+    history: []
+  };
+
+  const currentState = current.state || STATES.UNCLASSIFIED;
+  const allowed = VALID_TRANSITIONS[currentState] || [];
+
+  if (!allowed.includes(targetState) && currentState !== targetState) {
+    await logger.warn('StateMachine', `Invalid transition ${currentState} -> ${targetState} for thread ${threadId}`);
   }
 
-  let thread = await loadThreadState(threadId);
-
-  if (!thread) {
-    // New thread state initialization
-    thread = {
-      threadId,
-      state: VALID_STATES.UNCLASSIFIED,
-      history: [],
-      createdAt: new Date().toISOString()
-    };
-  }
-
-  const currentState = thread.state || VALID_STATES.UNCLASSIFIED;
-
-  // Check valid transition
-  if (currentState !== newState && ALLOWED_TRANSITIONS[currentState] && !ALLOWED_TRANSITIONS[currentState].includes(newState)) {
-    await logger.warn('StateMachine', `Direct transition from ${currentState} to ${newState} not allowed for thread ${threadId}`);
-  }
-
-  // Update thread fields
-  const updatedHistory = thread.history || [];
-  updatedHistory.push({
-    fromState: currentState,
-    toState: newState,
+  const historyEntry = {
+    from: currentState,
+    to: targetState,
     timestamp: new Date().toISOString(),
-    action: updatePayload.action || `Transitioned to ${newState}`,
-    note: updatePayload.note || null
-  });
+    ...metadata
+  };
 
   const updatedThread = {
-    ...thread,
-    ...updatePayload,
-    state: newState,
-    history: updatedHistory,
+    ...current,
+    state: targetState,
+    history: [...(current.history || []), historyEntry],
     lastUpdated: new Date().toISOString()
   };
 
-  await saveThreadState(threadId, updatedThread);
-  await logger.info('StateMachine', `Thread ${threadId} state: ${currentState} -> ${newState}`);
-
+  await saveUserThread(userEmail, threadId, updatedThread);
   return updatedThread;
 }
 
-/**
- * Cleanup threads older than 30 days in BOOKED state
- */
-async function cleanupOldThreads() {
-  try {
-    const allThreads = await listAllThreads();
-    const now = new Date();
-    const maxAgeMs = 30 * 24 * 60 * 60 * 1000;
+async function checkThreadTimeouts(userEmail) {
+  const threads = await listUserThreads(userEmail);
+  const now = Date.now();
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
-    let count = 0;
-    for (const thread of allThreads) {
-      if (thread.state === VALID_STATES.BOOKED && thread.lastUpdated) {
-        const age = now.getTime() - new Date(thread.lastUpdated).getTime();
-        if (age > maxAgeMs) {
-          await deleteThread(thread.threadId);
-          count++;
-        }
+  for (const thread of threads) {
+    if ([STATES.PROPOSED, STATES.NEGOTIATING].includes(thread.state)) {
+      const lastUpdated = new Date(thread.lastUpdated || 0).getTime();
+      if (now - lastUpdated > SEVEN_DAYS_MS) {
+        await transitionThread(userEmail, thread.threadId, STATES.UNRESOLVED, {
+          reason: 'Auto-timed out after 7 days without response'
+        });
       }
     }
-    if (count > 0) {
-      await logger.info('StateMachine', `Cleaned up ${count} old completed threads`);
-    }
-  } catch (err) {
-    await logger.error('StateMachine', 'Error cleaning up old threads', err.message);
   }
 }
 
 module.exports = {
-  VALID_STATES,
+  STATES,
   transitionThread,
-  cleanupOldThreads
+  checkThreadTimeouts
 };

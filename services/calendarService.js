@@ -1,8 +1,9 @@
 const { google } = require('googleapis');
-const { createOAuth2Client } = require('./gmailService');
-const { loadRefreshToken } = require('./memory');
+const { createOAuth2Client } = require('./oauthService');
+const { getUserTokens } = require('./userManager');
 const logger = require('./logger');
 
+const TIMEZONE = 'Asia/Kolkata';
 const INDIAN_HOLIDAYS_2026 = [
   '2026-01-26', // Republic Day
   '2026-03-20', // Holi
@@ -13,27 +14,22 @@ const INDIAN_HOLIDAYS_2026 = [
   '2026-12-25'  // Christmas
 ];
 
-/**
- * Get authenticated Google Calendar client
- */
-async function getCalendarClient() {
-  const refreshToken = await loadRefreshToken();
-  if (!refreshToken) {
-    throw new Error('No OAuth refresh token available for Google Calendar.');
+async function getCalendarClient(userEmail) {
+  const tokens = await getUserTokens(userEmail);
+  if (!tokens || (!tokens.refresh_token && !tokens.refreshToken)) {
+    throw new Error(`No OAuth refresh token available for Calendar for user ${userEmail}.`);
   }
 
   const oauth2Client = createOAuth2Client();
-  oauth2Client.setCredentials({ refresh_token: refreshToken });
+  const refreshToken = tokens.refresh_token || tokens.refreshToken;
+  oauth2Client.setCredentials({ ...tokens, refresh_token: refreshToken });
 
   return google.calendar({ version: 'v3', auth: oauth2Client });
 }
 
-/**
- * Analyze past 90 days of events to extract scheduling patterns and defaults
- */
-async function analyze90DayHistory() {
+async function analyze90DayHistory(userEmail) {
   try {
-    const calendar = await getCalendarClient();
+    const calendar = await getCalendarClient(userEmail);
     const now = new Date();
     const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
 
@@ -47,7 +43,6 @@ async function analyze90DayHistory() {
     });
 
     const events = res.data.items || [];
-
     let totalDurationMinutes = 0;
     let validEventCount = 0;
     const startHoursCount = {};
@@ -62,7 +57,6 @@ async function analyze90DayHistory() {
 
       if (isNaN(start.getTime()) || isNaN(end.getTime())) continue;
 
-      // Skip all-day events or multi-day events
       const durationMin = (end.getTime() - start.getTime()) / (1000 * 60);
       if (durationMin < 10 || durationMin > 480) continue;
 
@@ -80,12 +74,11 @@ async function analyze90DayHistory() {
       if (endHour > latestEndHour) latestEndHour = endHour;
     }
 
-    // If not enough data (< 10 events), return Indian default working patterns
     if (validEventCount < 10) {
-      await logger.info('CalendarService', `Fewer than 10 valid events (${validEventCount}) found. Using Indian default parameters.`);
+      await logger.info('CalendarService', `Fewer than 10 events for ${userEmail}. Using Indian default parameters.`);
       return {
         analyzedEventCount: validEventCount,
-        workingHours: { start: '09:30', end: '18:30', timezone: 'Asia/Kolkata' },
+        workingHours: { start: '09:30', end: '18:30', timezone: TIMEZONE },
         preferredDuration: 30,
         preferredHours: [10, 11, 14, 15, 16],
         noMeetingDays: ['Saturday', 'Sunday'],
@@ -95,7 +88,7 @@ async function analyze90DayHistory() {
       };
     }
 
-    const avgDuration = validEventCount > 0 ? Math.round(totalDurationMinutes / validEventCount) : 30;
+    const avgDuration = Math.round(totalDurationMinutes / validEventCount);
     const roundedDuration = avgDuration <= 20 ? 15 : (avgDuration <= 45 ? 30 : 60);
 
     const preferredHours = Object.keys(startHoursCount)
@@ -111,31 +104,26 @@ async function analyze90DayHistory() {
       }
     });
 
-    const analysis = {
+    return {
       analyzedEventCount: validEventCount,
       workingHours: {
         start: earliestStartHour === 24 ? '09:30' : `${String(earliestStartHour).padStart(2, '0')}:00`,
         end: latestEndHour === 0 ? '18:30' : `${String(latestEndHour).padStart(2, '0')}:00`,
-        timezone: 'Asia/Kolkata'
+        timezone: TIMEZONE
       },
       preferredDuration: roundedDuration,
       preferredHours: preferredHours.length > 0 ? preferredHours : [10, 11, 14, 15, 16],
       noMeetingDays: noMeetingDays.length > 0 ? noMeetingDays : ['Saturday', 'Sunday'],
       holidays: INDIAN_HOLIDAYS_2026,
-      suggestedBuffers: {
-        beforeMinutes: 15,
-        afterMinutes: 15
-      },
+      suggestedBuffers: { beforeMinutes: 15, afterMinutes: 15 },
       suggestedMaxMeetingsPerDay: 6
     };
 
-    await logger.info('CalendarService', 'Completed 90-day historical analysis', analysis);
-    return analysis;
   } catch (err) {
-    await logger.error('CalendarService', 'Error in 90-day analysis, using Indian defaults', err.message);
+    await logger.error('CalendarService', `Error in 90-day analysis for ${userEmail}: ${err.message}`);
     return {
       analyzedEventCount: 0,
-      workingHours: { start: '09:30', end: '18:30', timezone: 'Asia/Kolkata' },
+      workingHours: { start: '09:30', end: '18:30', timezone: TIMEZONE },
       preferredDuration: 30,
       preferredHours: [10, 11, 14, 15, 16],
       noMeetingDays: ['Saturday', 'Sunday'],
@@ -146,11 +134,8 @@ async function analyze90DayHistory() {
   }
 }
 
-/**
- * Check busy time intervals for a range
- */
-async function checkFreeBusy({ timeMin, timeMax, timeZone = 'Asia/Kolkata' }) {
-  const calendar = await getCalendarClient();
+async function checkFreeBusy(userEmail, timeMin, timeMax, timeZone = TIMEZONE) {
+  const calendar = await getCalendarClient(userEmail);
   const res = await calendar.freebusy.query({
     requestBody: {
       timeMin,
@@ -160,27 +145,16 @@ async function checkFreeBusy({ timeMin, timeMax, timeZone = 'Asia/Kolkata' }) {
     }
   });
 
-  return res.data.calendars.primary.busy || [];
+  return res.data.calendars?.primary?.busy || [];
 }
 
-/**
- * Check if a specific time slot is still free right now
- */
-async function checkSlotAvailable(startISO, endISO, timeZone = 'Asia/Kolkata') {
-  const busyList = await checkFreeBusy({
-    timeMin: startISO,
-    timeMax: endISO,
-    timeZone
-  });
-
+async function checkSlotAvailable(userEmail, startISO, endISO, timeZone = TIMEZONE) {
+  const busyList = await checkFreeBusy(userEmail, startISO, endISO, timeZone);
   return busyList.length === 0;
 }
 
-/**
- * Create a new calendar event with Google Meet link
- */
-async function createCalendarEvent({ summary, description, startISO, endISO, attendees = [], timeZone = 'Asia/Kolkata' }) {
-  const calendar = await getCalendarClient();
+async function createCalendarEvent({ userEmail, summary, description, startISO, endISO, attendees = [], timeZone = TIMEZONE }) {
+  const calendar = await getCalendarClient(userEmail);
 
   const eventBody = {
     summary,
@@ -205,7 +179,7 @@ async function createCalendarEvent({ summary, description, startISO, endISO, att
   const createdEvent = res.data;
   const meetLink = createdEvent.hangoutLink || createdEvent.conferenceData?.entryPoints?.[0]?.uri || null;
 
-  await logger.info('CalendarService', `Created Calendar Event: ${createdEvent.id}`, { summary, meetLink });
+  await logger.info('CalendarService', `Created Calendar Event for ${userEmail}: ${createdEvent.id}`, { summary, meetLink });
 
   return {
     eventId: createdEvent.id,
@@ -217,23 +191,12 @@ async function createCalendarEvent({ summary, description, startISO, endISO, att
   };
 }
 
-/**
- * Fetch specific event details
- */
-async function getEventDetails(eventId) {
-  const calendar = await getCalendarClient();
-  const res = await calendar.events.get({
-    calendarId: 'primary',
-    eventId
-  });
-  return res.data;
-}
-
 module.exports = {
   getCalendarClient,
   analyze90DayHistory,
   checkFreeBusy,
   checkSlotAvailable,
   createCalendarEvent,
-  getEventDetails
+  TIMEZONE,
+  INDIAN_HOLIDAYS_2026
 };
