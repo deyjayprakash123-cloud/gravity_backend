@@ -403,6 +403,7 @@ async function processSingleEmail(userEmail, messageId, gmail, userDir) {
     const from = headers.find(h => h.name === 'From')?.value || '';
     const subject = headers.find(h => h.name === 'Subject')?.value || '';
     const threadId = email.data.threadId;
+    const messageIdHeader = headers.find(h => h.name === 'Message-ID')?.value || '';
     
     console.log('📧 From:', from);
     console.log('📧 Subject:', subject);
@@ -478,11 +479,11 @@ async function processSingleEmail(userEmail, messageId, gmail, userDir) {
       // Generate reply
       console.log('✍️ Generating reply...');
       const replyBody = await generateReply(from, slots, tone, body);
-      console.log('📤 Reply generated');
+      console.log('📤 Reply generated:', replyBody.substring(0, 100));
       
-      // Send reply
-      console.log('📤 Sending reply...');
-      await sendEmailReply(gmail, threadId, replyBody);
+      // Send reply - PASS THE FROM ADDRESS
+      console.log('📤 Sending reply to:', from);
+      await sendEmailReply(gmail, threadId, replyBody, from, subject);
       console.log('✅ REPLY SENT SUCCESSFULLY!');
       
       // Save thread state
@@ -684,27 +685,59 @@ async function generateReply(from, slots, tone, originalBody) {
   }
 }
 
-async function sendEmailReply(gmail, threadId, body) {
-  const rawMessage = [
-    'Content-Type: text/plain; charset="UTF-8"',
-    'MIME-Version: 1.0',
-    '',
-    body
-  ].join('\n');
-  
-  const encodedMessage = Buffer.from(rawMessage)
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-  
-  await gmail.users.messages.send({
-    userId: 'me',
-    requestBody: {
-      raw: encodedMessage,
-      threadId: threadId
+async function sendEmailReply(gmail, threadId, body, recipientEmail, originalSubject) {
+  try {
+    console.log('📧 Preparing email to:', recipientEmail);
+    
+    // Extract clean email address from "Name <email>" format
+    let cleanEmail = recipientEmail;
+    const emailMatch = recipientEmail.match(/<(.+?)>/);
+    if (emailMatch) {
+      cleanEmail = emailMatch[1];
     }
-  });
+    console.log('📧 Clean email:', cleanEmail);
+    
+    // Create the email in RFC 2822 format with proper headers
+    const emailLines = [
+      `To: ${recipientEmail}`,
+      `Subject: Re: ${originalSubject || 'Meeting'}`,
+      'Content-Type: text/plain; charset="UTF-8"',
+      'MIME-Version: 1.0',
+      '',
+      body
+    ];
+    
+    const emailContent = emailLines.join('\r\n');
+    
+    // Encode to base64 for Gmail API
+    const encodedEmail = Buffer.from(emailContent)
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+    
+    console.log('📧 Email encoded, length:', encodedEmail.length);
+    
+    // Send via Gmail API
+    const response = await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: {
+        raw: encodedEmail,
+        threadId: threadId
+      }
+    });
+    
+    console.log('✅ Email sent successfully!');
+    console.log('📧 Message ID:', response.data.id);
+    console.log('📧 Thread ID:', response.data.threadId);
+    
+    return response.data;
+    
+  } catch (err) {
+    console.error('❌ Send email failed:', err.message);
+    console.error('❌ Full error:', err);
+    throw err;
+  }
 }
 
 // ============ USER API ROUTES ============
