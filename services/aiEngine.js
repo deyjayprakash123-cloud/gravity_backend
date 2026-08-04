@@ -2,7 +2,7 @@ const axios = require('axios');
 const logger = require('./logger');
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const MODEL_NAME = process.env.OPENROUTER_MODEL || 'google/gemma-4-26b-a4b-it:free';
+const MODEL_NAME = process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free';
 const CREDIT_EXHAUSTION_MESSAGE = "Not enough credits. Contact deyjayprakash123@gmail.com";
 
 async function classifyEmail(body, subject, history = []) {

@@ -477,7 +477,7 @@ async function classifyEmail(body, subject) {
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
-        model: 'meta-llama/llama-3-8b-instruct:free',
+        model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
         messages: [
           {
             role: 'system',
@@ -586,7 +586,7 @@ async function generateReply(from, slots, tone, originalBody) {
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
-        model: 'mistralai/mistral-7b-instruct',
+        model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
         messages: [
           {
             role: 'system',
