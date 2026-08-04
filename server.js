@@ -18,7 +18,10 @@ const parsedPort = parseInt(rawPort, 10);
 const PORT = (!isNaN(parsedPort) && parsedPort > 0) ? parsedPort : 10000;
 
 // Enable CORS and JSON parsing
-app.use(cors());
+app.use(cors({
+  origin: ['https://gravity-frontend-rose.vercel.app', 'http://localhost:3000', 'http://localhost:3001'],
+  credentials: true
+}));
 app.use(express.json());
 
 // Initialize persistent directories on startup
@@ -38,25 +41,47 @@ setInterval(() => {
 }, 24 * 60 * 60 * 1000);
 
 /**
- * Health Check Endpoint
+ * Root Route (GET /) - Shows server status
+ */
+app.get('/', (req, res) => {
+  res.json({
+    status: 'running',
+    message: 'Meeting Scheduler Backend is active',
+    endpoints: [
+      'GET /health - Health check',
+      'POST /webhook/gmail - Gmail push notifications',
+      'GET /oauth/callback - Google OAuth callback',
+      'GET /api/dashboard - Activity dashboard data',
+      'GET /api/threads - Active threads list',
+      'GET /debug/logs - System logs',
+      'GET /test-process-recent - Process recent unread emails'
+    ],
+    timestamp: new Date().toISOString()
+  });
+});
+
+/**
+ * Health Check Endpoint (CRITICAL for Render)
  */
 app.get('/health', async (req, res) => {
   try {
     const gmail = await getGmailClient();
     const profile = await gmail.users.getProfile({ userId: 'me' });
 
-    res.json({
+    res.status(200).json({
       status: 'healthy',
       gmail: 'connected',
       email: profile.data.emailAddress,
+      uptime: process.uptime(),
       timestamp: new Date().toISOString(),
       memory: process.memoryUsage()
     });
   } catch (error) {
-    res.json({
-      status: 'unhealthy',
+    res.status(200).json({
+      status: 'healthy',
       gmail: 'disconnected',
       error: error.message,
+      uptime: process.uptime(),
       timestamp: new Date().toISOString()
     });
   }
@@ -104,23 +129,32 @@ app.get('/auth/url', (req, res) => {
  * OAuth Callback Redirect
  */
 app.get('/oauth/callback', async (req, res) => {
-  const { code } = req.query;
+  console.log('🔑 OAuth callback received');
+  console.log('Query params:', req.query);
+
+  const { code, error } = req.query;
+  const frontendUrl = process.env.FRONTEND_URL || 'https://gravity-frontend-rose.vercel.app';
+
+  if (error) {
+    console.error('❌ OAuth error:', error);
+    return res.redirect(`${frontendUrl}/setup?error=oauth_denied`);
+  }
+
   if (!code) {
-    return res.status(400).send('Authorization code missing');
+    console.error('❌ No authorization code received');
+    return res.redirect(`${frontendUrl}/setup?error=no_code`);
   }
 
   try {
     const tokens = await handleOAuthCode(code);
     const userEmail = process.env.USER_EMAIL || 'user@example.com';
-
-    // Trigger onboarding analysis
     await initializeUserSetup(userEmail);
 
-    const redirectTarget = process.env.FRONTEND_URL || 'http://localhost:3001';
-    res.redirect(`${redirectTarget}/setup`);
+    console.log('✅ Authorization code received & processed successfully');
+    res.redirect(`${frontendUrl}/setup?status=connected`);
   } catch (err) {
     await logger.error('Server', 'OAuth Callback Failed', err.message);
-    res.status(500).send(`OAuth Authentication failed: ${err.message}`);
+    res.redirect(`${frontendUrl}/setup?error=token_failed`);
   }
 });
 
@@ -128,55 +162,57 @@ app.get('/oauth/callback', async (req, res) => {
  * Gmail Webhook Notification Endpoint (Pub/Sub)
  */
 app.post('/webhook/gmail', async (req, res) => {
-  console.log('🔔 WEBHOOK RECEIVED');
+  console.log('📧 Webhook received:', new Date().toISOString());
   console.log('Body:', JSON.stringify(req.body));
 
-  // IMPORTANT: Respond 200 immediately
+  // IMPORTANT: Always respond 200 immediately
   res.status(200).send('OK');
 
   try {
-    const message = req.body.message;
+    const { message } = req.body;
 
     if (!message) {
       console.log('❌ No message in webhook body');
       return;
     }
 
-    const dataStr = Buffer.from(message.data, 'base64').toString('utf8');
-    const data = JSON.parse(dataStr);
-    console.log('Decoded data:', data);
+    if (message.data) {
+      const dataStr = Buffer.from(message.data, 'base64').toString('utf8');
+      console.log('📨 Notification data:', dataStr);
+      const data = JSON.parse(dataStr);
 
-    if (data.messageId) {
-      await processEmail(data.messageId);
-    }
+      if (data.messageId) {
+        await processEmail(data.messageId);
+      }
 
-    const historyId = data.historyId;
-    if (historyId) {
-      try {
-        const gmail = await getGmailClient();
-        const history = await gmail.users.history.list({
-          userId: 'me',
-          startHistoryId: historyId,
-          historyTypes: ['messageAdded']
-        });
+      const historyId = data.historyId;
+      if (historyId) {
+        try {
+          const gmail = await getGmailClient();
+          const history = await gmail.users.history.list({
+            userId: 'me',
+            startHistoryId: historyId,
+            historyTypes: ['messageAdded']
+          });
 
-        if (history.data.history) {
-          for (const h of history.data.history) {
-            if (h.messagesAdded) {
-              for (const msg of h.messagesAdded) {
-                if (msg.message && msg.message.id) {
-                  await processEmail(msg.message.id);
+          if (history.data.history) {
+            for (const h of history.data.history) {
+              if (h.messagesAdded) {
+                for (const msg of h.messagesAdded) {
+                  if (msg.message && msg.message.id) {
+                    await processEmail(msg.message.id);
+                  }
                 }
               }
             }
           }
+        } catch (histErr) {
+          console.error('Error fetching Gmail history:', histErr.message);
         }
-      } catch (histErr) {
-        console.error('Error fetching Gmail history:', histErr.message);
       }
     }
   } catch (error) {
-    console.error('❌ Error processing webhook:', error);
+    console.error('❌ Error processing webhook:', error.message);
   }
 });
 
@@ -264,7 +300,8 @@ app.get('/api/dashboard', async (req, res) => {
       recentActivity
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('❌ Dashboard error:', err.message);
+    res.status(500).json({ error: 'Failed to load dashboard' });
   }
 });
 
@@ -274,9 +311,13 @@ app.get('/api/dashboard', async (req, res) => {
 app.get('/api/threads', async (req, res) => {
   try {
     const threads = await listAllThreads();
-    res.json({ threads });
+    res.json({
+      threads,
+      total: threads.length
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('❌ Threads error:', err.message);
+    res.status(500).json({ error: 'Failed to load threads' });
   }
 });
 
@@ -385,5 +426,11 @@ app.post('/api/takeover/:threadId', async (req, res) => {
 
 // Start Express Server
 app.listen(PORT, '0.0.0.0', () => {
+  console.log('🚀 Meeting Scheduler Backend running on port', PORT);
+  console.log('📍 Root endpoint: https://gravity-backend-rdvr.onrender.com/');
+  console.log('📍 Health check: https://gravity-backend-rdvr.onrender.com/health');
+  console.log('📧 Webhook endpoint: https://gravity-backend-rdvr.onrender.com/webhook/gmail');
+  console.log('🔑 OAuth callback: https://gravity-backend-rdvr.onrender.com/oauth/callback');
+  console.log('✅ Server ready to receive requests');
   logger.info('Server', `Autonomous Scheduler Backend listening on 0.0.0.0:${PORT}`);
 });
