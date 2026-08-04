@@ -3,6 +3,7 @@ const logger = require('./logger');
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL_NAME = process.env.OPENROUTER_MODEL || 'google/gemma-4-26b-a4b-it:free';
+const CREDIT_EXHAUSTION_MESSAGE = "Not enough credits. Contact deyjayprakash123@gmail.com";
 
 async function classifyEmail(body, subject, history = []) {
   if (!OPENROUTER_API_KEY) {
@@ -66,7 +67,11 @@ Return ONLY a raw JSON object matching this structure with no markdown backticks
 
     return parsed;
   } catch (err) {
-    await logger.warn('AIEngine', 'Classification fallback triggered', err.message);
+    if (err.response && (err.response.status === 402 || err.response.status === 429)) {
+      await logger.error('AIEngine', CREDIT_EXHAUSTION_MESSAGE, err.message);
+    } else {
+      await logger.warn('AIEngine', 'Classification fallback triggered', err.message);
+    }
     return fallbackHeuristicClassifier(subject, body);
   }
 }
@@ -137,7 +142,9 @@ async function generateProposalEmail(userEmail, senderName, slots, requestDetail
       const text = response.data.choices?.[0]?.message?.content?.trim();
       if (text) return text;
     } catch (err) {
-      // fallback
+      if (err.response && (err.response.status === 402 || err.response.status === 429)) {
+        await logger.error('AIEngine', CREDIT_EXHAUSTION_MESSAGE, err.message);
+      }
     }
   }
 
@@ -176,7 +183,9 @@ async function analyzeReply(body, threadState) {
       const cleanJson = response.data.choices[0].message.content.replace(/```json/g, '').replace(/```/g, '').trim();
       return JSON.parse(cleanJson);
     } catch (err) {
-      // fallback
+      if (err.response && (err.response.status === 402 || err.response.status === 429)) {
+        await logger.error('AIEngine', CREDIT_EXHAUSTION_MESSAGE, err.message);
+      }
     }
   }
 
@@ -203,6 +212,7 @@ async function generateConfirmation(senderName, bookedDetails, toneProfile = {})
 }
 
 module.exports = {
+  CREDIT_EXHAUSTION_MESSAGE,
   classifyEmail,
   generateProposalEmail,
   analyzeReply,

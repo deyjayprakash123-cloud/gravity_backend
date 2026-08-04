@@ -79,7 +79,7 @@ setInterval(() => {
 }, 24 * 60 * 60 * 1000);
 
 /**
- * Health Check Endpoint
+ * Health Check Endpoint (Proper JSON at GET / and GET /health)
  */
 app.get('/health', (req, res) => {
   res.status(200).json({
@@ -88,6 +88,34 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     timezone: TIMEZONE,
     serverTime: new Date().toLocaleString('en-IN', { timeZone: TIMEZONE })
+  });
+});
+
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'running',
+    app: 'Meeting Scheduler AI',
+    timezone: TIMEZONE,
+    serverTime: new Date().toLocaleString('en-IN', { timeZone: TIMEZONE }),
+    endpoints: [
+      'GET /health',
+      'GET /api/auth/url',
+      'GET /oauth/callback',
+      'GET /api/user/status?email=',
+      'GET /api/user/dashboard?email=',
+      'GET /api/credits/check'
+    ]
+  });
+});
+
+/**
+ * Credits Check Endpoint
+ */
+app.get('/api/credits/check', (req, res) => {
+  res.json({
+    hasCredits: true,
+    creditsRemaining: 100,
+    message: "Not enough credits. Contact deyjayprakash123@gmail.com"
   });
 });
 
@@ -187,7 +215,7 @@ app.get('/api/user/status', async (req, res) => {
 });
 
 /**
- * Shared Dashboard Handler (NO RECURSION, NO CALL STACK EXCEEDED)
+ * Shared Dashboard Handler
  */
 async function handleDashboardRequest(req, res) {
   try {
@@ -544,6 +572,11 @@ app.post('/webhook/gmail', async (req, res) => {
   } catch (error) {
     console.error('❌ Webhook error:', error.message);
   }
+});
+
+// 404 Catch-All JSON Response (Never returns HTML "Cannot GET")
+app.use((req, res) => {
+  res.status(404).json({ error: `Cannot ${req.method} ${req.path}` });
 });
 
 // Start Express Server

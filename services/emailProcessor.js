@@ -7,6 +7,9 @@ const { transitionThread, STATES } = require('./stateMachine');
 const { recordEmailHandled, recordMeetingBooked, recordThreadFlagged, recordActivity } = require('./statsTracker');
 const logger = require('./logger');
 
+// Only process emails received AFTER service start time
+const SERVICE_START_TIME = new Date();
+
 async function processEmail(userEmail, messageId) {
   await logger.info('EmailProcessor', `Processing email message ${messageId} for user ${userEmail}`);
 
@@ -20,19 +23,28 @@ async function processEmail(userEmail, messageId) {
   // 2. Fetch email details
   const email = await fetchEmailContent(userEmail, messageId);
 
-  // 3. Skip if sent by user self
+  // 3. Skip emails received BEFORE service start time
+  if (email.date) {
+    const emailTime = new Date(email.date);
+    if (!isNaN(emailTime.getTime()) && emailTime < SERVICE_START_TIME) {
+      await logger.info('EmailProcessor', `Skipping email ${messageId} received before service start time (${email.date})`);
+      return { status: 'SKIPPED_BEFORE_START' };
+    }
+  }
+
+  // 4. Skip if sent by user self
   if (email.senderEmail === userEmail.toLowerCase()) {
     await logger.info('EmailProcessor', `Skipping self-sent email ${messageId} for ${userEmail}`);
     return { status: 'SKIPPED_SELF' };
   }
 
-  // 4. Skip auto-responders
+  // 5. Skip auto-responders
   if (email.isAutoReply) {
     await logger.info('EmailProcessor', `Skipping auto-reply email ${messageId} for ${userEmail}`);
     return { status: 'SKIPPED_AUTOREPLY' };
   }
 
-  // 5. Load thread state
+  // 6. Load thread state
   let thread = (await getUserThread(userEmail, email.threadId)) || {
     threadId: email.threadId,
     userEmail,
@@ -43,8 +55,9 @@ async function processEmail(userEmail, messageId) {
     history: []
   };
 
-  // Skip duplicate processing
+  // Skip duplicate processing via message ID
   if ((thread.processedMessages || []).includes(messageId)) {
+    await logger.info('EmailProcessor', `Message ${messageId} already processed for thread ${email.threadId}`);
     return { status: 'ALREADY_PROCESSED' };
   }
   thread.processedMessages = [...(thread.processedMessages || []), messageId];
@@ -61,7 +74,7 @@ async function processEmail(userEmail, messageId) {
   const rules = (await getUserRules(userEmail)) || {};
   const tone = (await getUserTone(userEmail)) || {};
 
-  // 6. If thread is brand new or UNCLASSIFIED, run classifier
+  // 7. If thread is brand new or UNCLASSIFIED, run classifier
   if (!thread.state || thread.state === STATES.UNCLASSIFIED) {
     const classification = await classifyEmail(email.body, email.subject, thread.history || []);
 
@@ -127,7 +140,7 @@ async function processEmail(userEmail, messageId) {
     return { status: 'PROPOSED' };
   }
 
-  // 7. If thread is in PROPOSED or NEGOTIATING, evaluate reply
+  // 8. If thread is in PROPOSED or NEGOTIATING, evaluate reply
   if ([STATES.PROPOSED, STATES.NEGOTIATING].includes(thread.state)) {
     const analysis = await analyzeReply(email.body, thread);
 
@@ -209,5 +222,6 @@ async function processEmail(userEmail, messageId) {
 }
 
 module.exports = {
+  SERVICE_START_TIME,
   processEmail
 };
