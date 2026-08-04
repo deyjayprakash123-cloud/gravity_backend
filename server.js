@@ -1,14 +1,14 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { initializeStorage, listAllThreads, loadThreadState, getSchedulerState, setSchedulerState, saveUserRules, loadUserRules, saveToneProfile, loadToneProfile } = require('./memory');
-const { handleOAuthCode, getAuthUrl, setupGmailWatch } = require('./gmailService');
-const { initializeUserSetup } = require('./setupService');
-const { processEmail } = require('./emailProcessor');
-const { transitionThread, cleanupOldThreads } = require('./stateMachine');
-const { startKeepAlive } = require('./keepAlive');
-const { rotateLogs } = require('./logger');
-const logger = require('./logger');
+const { initializeStorage, listAllThreads, loadThreadState, getSchedulerState, setSchedulerState, saveUserRules, loadUserRules, saveToneProfile, loadToneProfile } = require('./services/memory');
+const { handleOAuthCode, getAuthUrl, setupGmailWatch } = require('./services/gmailService');
+const { initializeUserSetup } = require('./services/setupService');
+const { processEmail } = require('./services/emailProcessor');
+const { transitionThread, cleanupOldThreads } = require('./services/stateMachine');
+const { startKeepAlive } = require('./services/keepAlive');
+const { rotateLogs } = require('./services/logger');
+const logger = require('./services/logger');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
