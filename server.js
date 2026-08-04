@@ -293,51 +293,42 @@ app.get('/oauth/callback', async (req, res) => {
 // ============ EMAIL PROCESSING ENGINE ============
 
 async function processEmailsForUser(userEmail) {
-  console.log(`\n📬 ========== CHECKING: ${userEmail} ==========`);
-  console.log(`⏰ Time: ${new Date().toLocaleString('en-IN', { timeZone: TIMEZONE })}`);
+  console.log(`\n📬 CHECKING: ${userEmail}`);
+  const startTime = Date.now();
   
   try {
     const userDir = path.join(USERS_DIR, userEmail);
     
-    // Check all prerequisites
-    if (!await fs.pathExists(userDir)) {
-      console.log('❌ User directory missing');
-      return;
-    }
+    // Quick checks
+    if (!await fs.pathExists(userDir)) return;
     
     const pausedPath = path.join(userDir, 'paused.json');
     if (await fs.pathExists(pausedPath)) {
-      console.log('⏸️ Scheduler PAUSED');
+      console.log('⏸️ Paused');
       return;
     }
     
     const tokensPath = path.join(userDir, 'tokens.json');
-    if (!await fs.pathExists(tokensPath)) {
-      console.log('❌ No tokens file');
-      return;
-    }
+    if (!await fs.pathExists(tokensPath)) return;
     
     const rulesPath = path.join(userDir, 'rules.json');
-    if (!await fs.pathExists(rulesPath)) {
-      console.log('❌ No rules file');
-      return;
-    }
+    if (!await fs.pathExists(rulesPath)) return;
     
     const rules = await fs.readJson(rulesPath);
-    if (!rules.confirmed) {
-      console.log('❌ Rules not confirmed. Run setup first.');
-      return;
-    }
+    if (!rules.confirmed) return;
     
     // Load tokens
-    let tokens;
-    try {
-      tokens = await fs.readJson(tokensPath);
-      console.log('✅ Tokens loaded');
-    } catch (err) {
-      console.log('❌ Invalid tokens file');
-      return;
+    const tokens = await fs.readJson(tokensPath);
+    
+    // Get service start time from stats
+    const statsPath = path.join(userDir, 'stats.json');
+    let serviceStartTime = new Date().toISOString();
+    if (await fs.pathExists(statsPath)) {
+      const stats = await fs.readJson(statsPath);
+      serviceStartTime = stats.serviceStartedAt || new Date().toISOString();
     }
+    
+    console.log('🕐 Service started:', new Date(serviceStartTime).toLocaleString('en-IN', { timeZone: TIMEZONE }));
     
     // Create Gmail client
     const oauth2Client = new google.auth.OAuth2(
@@ -346,58 +337,56 @@ async function processEmailsForUser(userEmail) {
       'https://gravity-backend-rdvr.onrender.com/oauth/callback'
     );
     oauth2Client.setCredentials(tokens);
-    
-    // Test the connection first
-    try {
-      const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-      const profile = await gmail.users.getProfile({ userId: 'me' });
-      console.log('✅ Gmail connected as:', profile.data.emailAddress);
-    } catch (authErr) {
-      console.log('❌ Gmail auth failed:', authErr.message);
-      return;
-    }
-    
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     
-    // Search for unread emails - SIMPLIFIED QUERY
-    console.log('🔍 Searching for unread emails...');
+    // ONLY search for emails received AFTER service start time
+    const afterTimestamp = Math.floor(new Date(serviceStartTime).getTime() / 1000);
     
-    let messagesResponse;
-    try {
-      // Try simple query first
-      messagesResponse = await gmail.users.messages.list({
-        userId: 'me',
-        q: 'is:unread -from:me',
-        maxResults: 10
-      });
-    } catch (searchErr) {
-      console.log('❌ Email search failed:', searchErr.message);
-      return;
-    }
+    console.log('🔍 Searching for emails after:', new Date(serviceStartTime).toLocaleString('en-IN', { timeZone: TIMEZONE }));
+    
+    // Use Gmail's "after:" filter with timestamp
+    const messagesResponse = await gmail.users.messages.list({
+      userId: 'me',
+      q: `is:unread -from:me after:${afterTimestamp}`,
+      maxResults: 5  // Only check 5 most recent
+    });
     
     const messages = messagesResponse.data.messages || [];
-    console.log(`📧 Found ${messages.length} unread messages`);
+    console.log(`📧 Found ${messages.length} new unread messages`);
     
     if (messages.length === 0) {
-      console.log('📭 No unread messages');
-      console.log('========================================\n');
+      console.log('📭 No new messages');
       return;
     }
     
-    // Process messages...
-    for (const msg of messages) {
+    // Process only the first 3 (most recent)
+    const toProcess = messages.slice(0, 3);
+    
+    for (const msg of toProcess) {
+      // Check if already processed
+      const processedDir = path.join(userDir, 'processed');
+      await fs.ensureDir(processedDir);
+      const processedPath = path.join(processedDir, `${msg.id}.json`);
+      
+      if (await fs.pathExists(processedPath)) {
+        console.log('⏭️ Already processed:', msg.id);
+        continue;
+      }
+      
       await processSingleEmail(userEmail, msg.id, gmail, userDir);
     }
     
-    console.log('========================================\n');
+    const elapsed = Date.now() - startTime;
+    console.log(`✅ Check complete in ${elapsed}ms`);
     
   } catch (err) {
-    console.error('❌ processEmailsForUser error:', err.message);
+    console.error('❌ Error:', err.message);
   }
 }
 
 async function processSingleEmail(userEmail, messageId, gmail, userDir) {
-  console.log(`\n--- Processing message: ${messageId} ---`);
+  const startTime = Date.now();
+  console.log(`\n📧 Processing message: ${messageId}`);
   
   try {
     // Check if already processed
@@ -410,14 +399,7 @@ async function processSingleEmail(userEmail, messageId, gmail, userDir) {
       return;
     }
     
-    // Mark as processed immediately to prevent double processing
-    await fs.writeJson(processedPath, { 
-      processedAt: new Date().toISOString(),
-      messageId 
-    });
-    
-    // Get full email
-    console.log('📥 Fetching full email...');
+    // Fetch email
     const email = await gmail.users.messages.get({
       userId: 'me',
       id: messageId,
@@ -425,10 +407,41 @@ async function processSingleEmail(userEmail, messageId, gmail, userDir) {
     });
     
     const headers = email.data.payload.headers;
+    const internalDate = parseInt(email.data.internalDate);
+    const emailDate = new Date(internalDate);
+    
+    // Get service start time
+    const statsPath = path.join(userDir, 'stats.json');
+    let serviceStartTime = new Date().toISOString();
+    if (await fs.pathExists(statsPath)) {
+      const stats = await fs.readJson(statsPath);
+      serviceStartTime = stats.serviceStartedAt || new Date().toISOString();
+    }
+    const serviceStart = new Date(serviceStartTime);
+    
+    // SKIP if email is from BEFORE service started
+    if (emailDate < serviceStart) {
+      console.log('⏭️ SKIPPING: Email from', emailDate.toLocaleString('en-IN', { timeZone: TIMEZONE }), '- BEFORE service start');
+      // Mark as processed so we don't check it again
+      await fs.writeJson(processedPath, { 
+        processedAt: new Date().toISOString(),
+        skipped: true,
+        reason: 'before_service_start',
+        emailDate: emailDate.toISOString(),
+        serviceStart: serviceStart.toISOString()
+      });
+      return;
+    }
+    
+    console.log('📅 Email date:', emailDate.toLocaleString('en-IN', { timeZone: TIMEZONE }));
+    console.log('✅ Email is NEW - processing');
+    
+    // Mark as processed immediately
+    await fs.writeJson(processedPath, { processedAt: new Date().toISOString() });
+    
     const from = headers.find(h => h.name === 'From')?.value || '';
     const subject = headers.find(h => h.name === 'Subject')?.value || '';
     const threadId = email.data.threadId;
-    const messageIdHeader = headers.find(h => h.name === 'Message-ID')?.value || '';
     
     console.log('📧 From:', from);
     console.log('📧 Subject:', subject);
@@ -948,6 +961,35 @@ app.get('/api/user/status', async (req, res) => {
     paused,
     email
   });
+});
+
+// Reset processed emails and start fresh
+app.post('/api/user/reset-processed', async (req, res) => {
+  const email = (req.body?.email || req.query?.email || '').toLowerCase().trim();
+  if (!email) return res.status(400).json({ error: 'Email required' });
+  
+  const userDir = path.join(USERS_DIR, email);
+  const processedDir = path.join(userDir, 'processed');
+  
+  if (await fs.pathExists(processedDir)) {
+    await fs.remove(processedDir);
+    await fs.ensureDir(processedDir);
+  }
+  
+  // Update service start time to NOW
+  const statsPath = path.join(userDir, 'stats.json');
+  if (await fs.pathExists(statsPath)) {
+    const stats = await fs.readJson(statsPath);
+    stats.serviceStartedAt = new Date().toISOString();
+    await fs.writeJson(statsPath, stats);
+  }
+  
+  console.log('🔄 Reset processed emails for:', email);
+  
+  // Trigger immediate check
+  processEmailsForUser(email);
+  
+  res.json({ success: true, message: 'Reset complete. Only new emails will be processed.' });
 });
 
 app.get('/api/user/dashboard', async (req, res) => {
