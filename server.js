@@ -54,6 +54,31 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
+// Webhook endpoint for ActivePieces & Gmail triggers
+app.all('/webhook/gmail', async (req, res) => {
+  console.log('📥 Webhook received from ActivePieces / Gmail trigger');
+  console.log('Payload:', JSON.stringify(req.body));
+  
+  const { emailAddress, from, subject, body, threadId, messageId } = req.body || {};
+  const recipientUser = (emailAddress || req.query?.email || '').toLowerCase().trim();
+  
+  if (recipientUser) {
+    processEmailsForUser(recipientUser).catch(err => console.error('Webhook user check error:', err.message));
+    return res.status(200).json({ status: 'received', message: 'Webhook processing initiated', recipientUser });
+  }
+  
+  // Fallback: trigger email processing for all registered users
+  try {
+    const users = await getGlobalUserList();
+    for (const user of users) {
+      processEmailsForUser(user).catch(err => console.error('Webhook global check error:', err.message));
+    }
+    return res.status(200).json({ status: 'received', message: 'Webhook triggered for all users', count: users.length });
+  } catch (err) {
+    return res.status(200).json({ status: 'received', message: 'Webhook received' });
+  }
+});
+
 // ============ OAUTH ROUTES ============
 
 // Generate OAuth URL
