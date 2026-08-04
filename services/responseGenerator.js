@@ -3,7 +3,7 @@ const { loadToneProfile } = require('./memory');
 const logger = require('./logger');
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const MODEL_NAME = process.env.OPENROUTER_MODEL || 'meta-llama/llama-3-8b-instruct:free';
+const MODEL_NAME = process.env.OPENROUTER_MODEL || 'google/gemma-4-26b-a4b-it:free';
 
 /**
  * Generate customized AI email response using OpenRouter API
