@@ -11,7 +11,9 @@ const { rotateLogs } = require('./services/logger');
 const logger = require('./services/logger');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const rawPort = process.env.PORT;
+const parsedPort = parseInt(rawPort, 10);
+const PORT = (!isNaN(parsedPort) && parsedPort > 0) ? parsedPort : 10000;
 
 // Enable CORS and JSON parsing
 app.use(cors());
@@ -278,6 +280,6 @@ app.post('/api/takeover/:threadId', async (req, res) => {
 });
 
 // Start Express Server
-app.listen(PORT, () => {
-  logger.info('Server', `Autonomous Scheduler Backend listening on port ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  logger.info('Server', `Autonomous Scheduler Backend listening on 0.0.0.0:${PORT}`);
 });
